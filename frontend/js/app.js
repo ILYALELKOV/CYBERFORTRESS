@@ -36,10 +36,35 @@
     if (p >= 70) return 'warn';
     return '';
   }
-  function statusByLoad(p) {
-    if (p >= 90) return { led: 'crit', label: 'CRITICAL', class: 'crit' };
-    if (p >= 70) return { led: 'warn', label: 'WARNING',  class: 'warn' };
-    return { led: '', label: 'OPERATIONAL', class: '' };
+  function systemStatus(cpuLoad, memLoad, gpuUtil) {
+    const n = { cpu: `CPU ${Math.round(cpuLoad)}%`, mem: `MEM ${Math.round(memLoad)}%`, gpu: `GPU ${Math.round(gpuUtil)}%` };
+    const crit = [cpuLoad >= 90 && n.cpu, memLoad >= 90 && n.mem, gpuUtil >= 90 && n.gpu].filter(Boolean);
+    if (crit.length) return { led: 'crit', label: crit.join(' · '), tip: 'CRITICAL — immediate action required', class: 'crit' };
+    const warn = [cpuLoad >= 70 && n.cpu, memLoad >= 70 && n.mem, gpuUtil >= 70 && n.gpu].filter(Boolean);
+    if (warn.length) return { led: 'warn', label: warn.join(' · '), tip: 'WARNING — monitor these components', class: 'warn' };
+    return { led: '', label: 'OPERATIONAL', tip: 'All systems within normal parameters', class: '' };
+  }
+  function tempColor(t, warn = 70, crit = 85) {
+    if (t == null) return 'var(--tx-mid)';
+    if (t >= crit) return 'var(--crit)';
+    if (t >= warn) return 'var(--warn)';
+    return 'var(--ok)';
+  }
+  function parseLinuxUptime(raw) {
+    if (!raw) return '—';
+    // Вырезаем "up ..." до ", N users" или " load" или конца
+    const upMatch = raw.match(/up\s+(.+?)(?:,\s*\d+\s+user|\s+load|$)/i);
+    if (!upMatch) return '—';
+    const s = upMatch[1].trim();
+    let d = 0, h = 0, mn = 0;
+    // "X day(s), H:MM"
+    const dhm = s.match(/(\d+)\s+days?,\s*(\d+):(\d+)/i);
+    if (dhm) { d = +dhm[1]; h = +dhm[2]; mn = +dhm[3]; }
+    // "H:MM" (без дней)
+    else { const hm = s.match(/^(\d+):(\d+)$/); if (hm) { h = +hm[1]; mn = +hm[2]; } }
+    // "X min"
+    if (!dhm && !s.match(/:/)) { const mm = s.match(/(\d+)\s+min/i); if (mm) mn = +mm[1]; }
+    return d > 0 ? `${d}d ${h}h ${mn}m` : h > 0 ? `${h}h ${mn}m` : `${mn}m`;
   }
   function gpuArr(g) {
     // PowerShell sometimes serializes single-GPU as object instead of array
@@ -434,21 +459,21 @@
     const memLoad = D.memory?.used_percent ?? 0;
     const gpu0 = gpuArr(D.gpu)[0];
     const gpuUtil = gpu0?.gpu_util_percent ?? 0;
-    const overall = Math.max(cpuLoad, memLoad, gpuUtil);
-    const st = statusByLoad(overall);
+    const st = systemStatus(cpuLoad, memLoad, gpuUtil);
     $('statusLed').className = 'status-led ' + st.led;
     $('statusLabel').className = 'status-label ' + st.class;
     $('statusLabel').textContent = st.label;
+    $('statusPod').title = st.tip;
 
     /* ---------- gauges ---------- */
     const cpuMhz = D.cpu?.current_mhz || 0;
     const cpuGhz = (cpuMhz / 1000).toFixed(2);
     const cpuTemp = D.cpu?.temp_c;
     const cpuTempStr = cpuTemp != null ? `${cpuTemp}°C` : 'N/A';
-    $('cpuTag').textContent = `${D.cpu?.cores || '?'}C/${D.cpu?.threads || '?'}T · ${cpuTempStr}`;
+    $('cpuTag').innerHTML = `${D.cpu?.cores || '?'}C/${D.cpu?.threads || '?'}T · <span style="color:${tempColor(cpuTemp)}">${cpuTempStr}</span>`;
     renderGauge($('gaugeCpu'), {
       value: cpuLoad, label: 'LOAD', base: 'cyan',
-      secondary: `<span class="v">${cpuGhz}</span> GHz · <span class="v">${cpuTempStr}</span>`
+      secondary: `${cpuGhz} GHz · <span style="color:${tempColor(cpuTemp)};font-weight:600;">${cpuTempStr}</span>`
     });
 
     // memory frequency from highest module
@@ -462,10 +487,10 @@
     });
 
     if (gpu0 && gpu0.gpu_util_percent !== undefined && gpu0.gpu_util_percent !== null) {
-      $('gpuTag').textContent = `${gpu0.temp_c ?? '?'}°C · ${fmt(gpu0.power_w ?? 0, 0)}W`;
+      $('gpuTag').innerHTML = `<span style="color:${tempColor(gpu0.temp_c, 75, 90)}">${gpu0.temp_c ?? '?'}°C</span> · ${fmt(gpu0.power_w ?? 0, 0)}W`;
       renderGauge($('gaugeGpu'), {
         value: gpu0.gpu_util_percent, label: 'UTIL', base: 'amber',
-        secondary: `<span class="v">${gpu0.temp_c ?? '?'}</span>°C · <span class="v">${fmt(gpu0.power_w ?? 0, 0)}</span> W`
+        secondary: `<span style="color:${tempColor(gpu0.temp_c, 75, 90)};font-weight:600;">${gpu0.temp_c ?? '?'}°C</span> · <span class="v">${fmt(gpu0.power_w ?? 0, 0)}</span> W`
       });
     } else if (gpu0) {
       $('gpuTag').textContent = gpu0.resolution || '—';
@@ -483,10 +508,10 @@
     const diskTemp = sysPhysDisk?.temp_c;
     const diskTempStr = diskTemp != null ? `${diskTemp}°C` : 'N/A';
     if (sysDrive) {
-      $('diskTag').textContent = `${sysDrive.drive} · ${diskTempStr}`;
+      $('diskTag').innerHTML = `${sysDrive.drive} · <span style="color:${tempColor(diskTemp, 45, 60)}">${diskTempStr}</span>`;
       renderGauge($('gaugeDisk'), {
         value: sysDrive.used_percent, label: sysDrive.label || sysDrive.drive, base: 'violet',
-        secondary: `<span class="v">${fmt(sysDrive.free_gb, 0)}</span> GB free · <span class="v">${diskTempStr}</span>`
+        secondary: `<span class="v">${fmt(sysDrive.free_gb, 0)}</span> GB free · <span style="color:${tempColor(diskTemp, 45, 60)};font-weight:600;">${diskTempStr}</span>`
       });
     } else {
       $('diskTag').textContent = '—';
@@ -558,7 +583,7 @@
         let live = '';
         if (g.gpu_util_percent !== undefined && g.gpu_util_percent !== null) {
           const vramPct = g.vram_total_mb ? Math.round((g.vram_used_mb / g.vram_total_mb) * 100) : 0;
-          const tempColor = (g.temp_c >= 80) ? 'var(--crit)' : (g.temp_c >= 70 ? 'var(--warn)' : 'var(--acc-amber)');
+          const gpuTempClr = (g.temp_c >= 80) ? 'var(--crit)' : (g.temp_c >= 70 ? 'var(--warn)' : 'var(--acc-amber)');
           live = `
             <div class="divider"></div>
             <div class="kv">
@@ -573,7 +598,7 @@
             <div class="bar" style="margin:4px 0 12px 0;"><div class="bar-fill ${colorForPercent(vramPct)}" style="width:${vramPct}%"></div></div>
             <div class="kv">
               <div class="k">TEMPERATURE</div>
-              <div class="v" style="color:${tempColor};font-family:'Orbitron',sans-serif;">${g.temp_c}°C</div>
+              <div class="v" style="color:${gpuTempClr};font-family:'Orbitron',sans-serif;">${g.temp_c}°C</div>
               <div class="k">POWER DRAW</div>
               <div class="v" style="font-family:'Orbitron',sans-serif;">${fmt(g.power_w, 1)} W</div>
             </div>
@@ -782,7 +807,15 @@
       else                  tempStatusHtml = '<span style="color:var(--ok)">NORMAL</span>';
     }
 
-    const synoUptime = (i.uptime_raw || '').split(',')[0].trim() || '—';
+    const synoUptime = (() => {
+      if (i.uptime_sec) {
+        const us = i.uptime_sec;
+        const d = Math.floor(us / 86400), h = Math.floor((us % 86400) / 3600),
+              m = Math.floor((us % 3600) / 60), s = us % 60;
+        return d > 0 ? `${d}d ${h}h ${m}m ${s}s` : h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
+      }
+      return parseLinuxUptime(i.uptime_raw);
+    })();
 
     // Сетевая нагрузка (трафик-индикатор в углу)
     const synoRxRate = rateFrom(H.synoRx);
@@ -1399,7 +1432,7 @@
       if (old) old.remove();
       const s = document.createElement('script');
       s.id = 'telemetry-script';
-      s.src = `system-data.js?_=${Date.now()}`;
+      s.src = `../data/system-data.js?_=${Date.now()}`;
       s.onload = () => resolve(window.SYSTEM_DATA);
       s.onerror = () => resolve(null);
       document.body.appendChild(s);

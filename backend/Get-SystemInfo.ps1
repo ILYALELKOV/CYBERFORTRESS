@@ -38,9 +38,10 @@ if (-not $script:HereDir -or $script:HereDir -eq '') {
     $script:HereDir = (Get-Location).Path
 }
 
-if (-not $ConfigPath) { $ConfigPath = Join-Path $script:HereDir 'config.json' }
-if (-not $OutputPath) { $OutputPath = Join-Path $script:HereDir 'system-data.js' }
-if (-not $EnvPath)    { $EnvPath    = Join-Path $script:HereDir '.env' }
+$script:RootDir = Split-Path $script:HereDir -Parent
+if (-not $ConfigPath) { $ConfigPath = Join-Path $script:RootDir 'config.json' }
+if (-not $OutputPath) { $OutputPath = Join-Path $script:RootDir 'data\system-data.js' }
+if (-not $EnvPath)    { $EnvPath    = Join-Path $script:RootDir '.env' }
 
 # Force absolute paths
 $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
@@ -559,7 +560,9 @@ echo "===END==="
             if ($rssh.ok) {
                 $sections = @{}
                 $current = $null; $buf = @()
-                foreach ($line in ($rssh.output -split "`n")) {
+                # Normalize: put section markers on their own lines even if glued to previous output
+                $normalizedOutput = $rssh.output -replace '(===\w+===)', "`n`$1`n"
+                foreach ($line in ($normalizedOutput -split "`n")) {
                     if ($line -match '^===(.+?)===\r?$') {
                         if ($current) { $sections[$current] = ($buf -join "`n").Trim() }
                         $current = $matches[1]; $buf = @()
@@ -1026,7 +1029,7 @@ function Get-JunkInfo {
     $totalCount = ($cats | Where-Object { $_.size_bytes -gt 0 }).Count
 
     $lastCleanLog = $null
-    $logFile = Join-Path $script:HereDir 'last-cleanup.json'
+    $logFile = Join-Path $script:RootDir 'data\last-cleanup.json'
     if (Test-Path $logFile) {
         try { $lastCleanLog = Get-Content -Raw -Path $logFile | ConvertFrom-Json } catch { }
     }
@@ -1150,6 +1153,7 @@ function Get-SynologyInfo {
 echo "===HOSTNAME==="; hostname
 echo "===UNAME==="; uname -a
 echo "===UPTIME==="; uptime
+echo "===UPTIMESEC==="; cat /proc/uptime 2>/dev/null
 echo "===LOADAVG==="; cat /proc/loadavg
 echo "===MEMINFO==="; head -5 /proc/meminfo
 echo "===CPUINFO==="; grep -m1 "model name" /proc/cpuinfo
@@ -1175,7 +1179,8 @@ echo "===END==="
     # Парсим вывод по маркерам
     $sections = @{}
     $current = $null; $buf = @()
-    foreach ($line in ($ssh.output -split "`n")) {
+    $normalizedSsh = $ssh.output -replace '(===\w+===)', "`n`$1`n"
+    foreach ($line in ($normalizedSsh -split "`n")) {
         if ($line -match '^===(.+?)===\r?$') {
             if ($current) { $sections[$current] = ($buf -join "`n").Trim() }
             $current = $matches[1]; $buf = @()
@@ -1189,6 +1194,9 @@ echo "===END==="
     $info.hostname = $sections['HOSTNAME']
     $info.kernel   = $sections['UNAME']
     $info.uptime_raw = $sections['UPTIME']
+    if ($sections['UPTIMESEC'] -match '^([\d.]+)\s') {
+        $info.uptime_sec = [int][double]$matches[1]
+    }
 
     # Loadavg
     if ($sections['LOADAVG'] -match '^([\d.]+)\s+([\d.]+)\s+([\d.]+)') {
@@ -1485,7 +1493,7 @@ if ($Watch) {
     Write-Host "[OK] Снепшот сохранён: $OutputPath" -ForegroundColor Green
 
     if ($Open) {
-        $html = Join-Path $PSScriptRoot 'dashboard.html'
+        $html = Join-Path $script:RootDir 'frontend\index.html'
         if (Test-Path $html) {
             Write-Host "[+] Открытие dashboard..." -ForegroundColor Cyan
             Start-Process $html

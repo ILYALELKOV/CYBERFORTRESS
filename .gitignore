@@ -5,10 +5,10 @@
 .claude
 
 # Сгенерированные снепшоты — содержат IP, MAC, серийники, hostname-ы
-system-data.js
+data/system-data.js
 
 # Логи и временные файлы
-last-cleanup.json
+data/last-cleanup.json
 cybfortress_cleanup.signal
 *.log
 

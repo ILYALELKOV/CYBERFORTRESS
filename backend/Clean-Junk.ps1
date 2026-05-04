@@ -900,7 +900,7 @@ $summary = @{
     elapsed_sec  = $elapsed
     categories   = ,$results
 }
-$logPath = Join-Path $PSScriptRoot 'last-cleanup.json'
+$logPath = Join-Path (Split-Path $PSScriptRoot -Parent) 'data\last-cleanup.json'
 try {
     $summary | ConvertTo-Json -Depth 6 | Set-Content -Path $logPath -Encoding UTF8
 } catch {
@@ -918,7 +918,7 @@ if ($diskBefore.total -gt 0) {
 Write-Host ""
 
 # Write detailed Markdown report
-$logsDir = Join-Path $PSScriptRoot 'logs'
+$logsDir = Join-Path (Split-Path $PSScriptRoot -Parent) 'data\logs'
 $mdPath  = Write-MdReport -Results $results -Summary $summary `
                -DiskBefore $diskBefore -DiskAfter $diskAfter `
                -OsInfo $osInfo -LogDir $logsDir

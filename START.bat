@@ -13,14 +13,14 @@ REM kill any orphaned watcher
 taskkill /FI "WINDOWTITLE eq CYBERFORTRESS_TELEMETRY*" /F >nul 2>&1
 
 REM remove stale snapshot
-if exist "%~dp0system-data.js" del /Q "%~dp0system-data.js" >nul 2>&1
+if exist "%~dp0data\system-data.js" del /Q "%~dp0data\system-data.js" >nul 2>&1
 
 echo  [1/3] Starting telemetry in background (PowerShell -Watch)...
-start "CYBERFORTRESS_TELEMETRY" /MIN powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Get-SystemInfo.ps1" -Watch -Interval 3
+start "CYBERFORTRESS_TELEMETRY" /MIN powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0backend\Get-SystemInfo.ps1" -Watch -Interval 3
 
 echo  [2/3] Opening dashboard (auto-loads on first snapshot)...
 timeout /t 1 /nobreak >nul
-start "" "%~dp0dashboard.html"
+start "" "%~dp0frontend\index.html"
 
 echo.
 echo  ----------------------------------------------------
