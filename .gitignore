@@ -1,0 +1,18 @@
+# Секреты — НИКОГДА не должны попадать в коммиты
+.env
+.env.local
+*.secret
+.claude
+
+# Сгенерированные снепшоты — содержат IP, MAC, серийники, hostname-ы
+system-data.js
+
+# Логи и временные файлы
+last-cleanup.json
+cybfortress_cleanup.signal
+*.log
+
+# Системные
+Thumbs.db
+.DS_Store
+desktop.ini

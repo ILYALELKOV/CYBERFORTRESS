@@ -1,0 +1,17 @@
+{
+  "synology": {
+    "enabled": true,
+    "sshKeyPath": "",
+    "_comment": "host/user/port/pass берутся из .env. Для использования ключа вместо пароля — путь указывается в sshKeyPath."
+  },
+  "router": {
+    "enabled": true,
+    "host": "192.168.50.1",
+    "_comment_host": "Пусто = авто-определение через default gateway",
+    "model": "ASUS"
+  },
+  "dashboard": {
+    "title": "CYBERFORTRESS // SYSTEM CONTROL",
+    "operator": "OPERATOR"
+  }
+}

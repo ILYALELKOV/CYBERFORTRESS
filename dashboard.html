@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CYBERFORTRESS // SYSTEM CONTROL</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<link rel="stylesheet" href="dashboard.css">
+</head>
+
+<body>
+<div class="shell">
+
+  <!-- ====== UNIFIED TOP BAR ====== -->
+  <div class="topbar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div class="brand-text">
+        <div class="title">CYBERFORTRESS<span class="version">v2.2</span></div>
+      </div>
+    </div>
+
+    <div class="topbar-meta">
+      <div class="meta-block">
+        <div class="label">OPERATOR</div>
+        <div class="value" id="metaOperator">—</div>
+      </div>
+      <div class="meta-block">
+        <div class="label">HOSTNAME</div>
+        <div class="value accent" id="metaHostname">—</div>
+      </div>
+      <div class="meta-block">
+        <div class="label">UPTIME</div>
+        <div class="value" id="metaUptime">—</div>
+      </div>
+      <div class="meta-block">
+        <div class="label">SNAPSHOT</div>
+        <div class="value" id="metaAge">—<span class="live-tick"></span></div>
+      </div>
+    </div>
+
+    <div class="status-pod" id="statusPod">
+      <div class="status-led" id="statusLed"></div>
+      <div class="status-label" id="statusLabel">OPERATIONAL</div>
+    </div>
+
+    <button class="theme-toggle" id="themeToggle" title="Toggle theme">☾</button>
+  </div>
+
+ <!-- ====== GITHUB RELEASES (3x-ui, Xray-core) ====== -->
+  <div class="grid">
+    <div class="card accent-violet">
+      <div class="card-head">
+        <div class="card-title">PROXY STACK // RELEASES (GITHUB)</div>
+        <div class="card-tag" id="releasesTag">—</div>
+      </div>
+      <div id="releasesDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== HISTORY CHART (live) ====== -->
+  <div class="grid">
+    <div class="card history-card">
+      <div class="card-head">
+        <div class="card-title">LIVE TELEMETRY // LAST 3 MIN</div>
+        <div class="history-legend">
+          <div class="item cpu">CPU <span class="v" id="legendCpu">—</span></div>
+          <div class="item mem">MEM <span class="v" id="legendMem">—</span></div>
+          <div class="item gpu">GPU <span class="v" id="legendGpu">—</span></div>
+          <div class="item disk">DISK <span class="v" id="legendDisk">—</span></div>
+          <div class="item cpu-temp">CPU°C <span class="v" id="legendCpuTemp">—</span></div>
+          <div class="item gpu-temp">GPU°C <span class="v" id="legendGpuTemp">—</span></div>
+        </div>
+      </div>
+      <div class="history-host"><canvas id="historyChart"></canvas></div>
+    </div>
+  </div>
+
+  <!-- ====== GAUGES ROW ====== -->
+  <div class="grid cols-4">
+    <div class="card" id="cardCpu">
+      <div class="card-head">
+        <div class="card-title">CPU LOAD</div>
+        <div class="card-tag" id="cpuTag">—</div>
+      </div>
+      <div class="gauge" id="gaugeCpu"></div>
+    </div>
+
+    <div class="card accent-pink" id="cardMem">
+      <div class="card-head">
+        <div class="card-title">MEMORY</div>
+        <div class="card-tag" id="memTag">—</div>
+      </div>
+      <div class="gauge" id="gaugeMem"></div>
+    </div>
+
+    <div class="card accent-amber" id="cardGpu">
+      <div class="card-head">
+        <div class="card-title">GPU</div>
+        <div class="card-tag" id="gpuTag">—</div>
+      </div>
+      <div class="gauge" id="gaugeGpu"></div>
+    </div>
+
+    <div class="card accent-violet" id="cardDisk">
+      <div class="card-head">
+        <div class="card-title">PRIMARY DRIVE</div>
+        <div class="card-tag" id="diskTag">—</div>
+      </div>
+      <div class="gauge" id="gaugeDisk"></div>
+    </div>
+  </div>
+
+  <!-- ====== ROUTER ====== -->
+  <div class="grid">
+    <div class="card accent-pink">
+      <div class="card-head">
+        <div class="card-title">ROUTER // GATEWAY</div>
+        <div class="card-tag" id="routerTag">—</div>
+      </div>
+      <div id="routerDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== SYNOLOGY ====== -->
+  <div class="grid">
+    <div class="card accent-amber">
+      <div class="card-head">
+        <div class="card-title">SYNOLOGY // NAS</div>
+        <div class="card-tag" id="synoTag">—</div>
+      </div>
+      <div id="synoDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== CPU + MEMORY DETAILS ====== -->
+  <div class="grid split-2-1">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">CPU // PROCESSOR DETAIL</div>
+        <div class="card-tag">CIM</div>
+      </div>
+      <div id="cpuDetail"></div>
+    </div>
+    <div class="card accent-pink">
+      <div class="card-head">
+        <div class="card-title">MEM // PHYSICAL MODULES</div>
+        <div class="card-tag" id="memModTag">—</div>
+      </div>
+      <div id="memModules"></div>
+    </div>
+  </div>
+
+  <!-- ====== GPU + MOTHERBOARD ====== -->
+  <div class="grid cols-2">
+    <div class="card accent-amber">
+      <div class="card-head">
+        <div class="card-title">GPU // GRAPHICS</div>
+        <div class="card-tag" id="gpuLiveTag">DXGI</div>
+      </div>
+      <div id="gpuDetail"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">PLATFORM // MOTHERBOARD &amp; BIOS</div>
+        <div class="card-tag">SMBIOS</div>
+      </div>
+      <div id="platformDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== STORAGE ====== -->
+  <div class="grid">
+    <div class="card accent-violet">
+      <div class="card-head">
+        <div class="card-title">STORAGE // VOLUMES</div>
+        <div class="card-tag" id="storageTag">—</div>
+      </div>
+      <div id="storageDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== NETWORK ====== -->
+  <div class="grid">
+    <div class="card accent-blue">
+      <div class="card-head">
+        <div class="card-title">NETWORK // INTERFACES &amp; THROUGHPUT</div>
+        <div class="card-tag" id="netTag">—</div>
+      </div>
+      <div id="netDetail"></div>
+      <div class="chart-host" style="margin-top: 14px;">
+        <canvas id="netThroughputChart"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ====== SYSTEM ERRORS ====== -->
+  <div class="grid">
+    <div class="card accent-pink">
+      <div class="card-head">
+        <div class="card-title">SYSTEM // ERRORS &amp; CRITICAL</div>
+        <div class="card-tag" id="errorsTag">—</div>
+      </div>
+      <div id="errorsDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== LAN DEVICES ====== -->
+  <div class="grid">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">LAN // DISCOVERED DEVICES</div>
+        <div class="card-tag" id="lanTag">—</div>
+      </div>
+      <div id="lanDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== WINDOWS UPDATES (перед очисткой) ====== -->
+  <div class="grid">
+    <div class="card accent-amber">
+      <div class="card-head">
+        <div class="card-title">WINDOWS // UPDATES</div>
+        <div class="card-tag" id="updatesTag">—</div>
+      </div>
+      <div id="updatesDetail"></div>
+    </div>
+  </div>
+
+  <!-- ====== JUNK CLEANER ====== -->
+  <div class="grid">
+    <div class="card accent-pink">
+      <div class="card-head">
+        <div class="card-title">JUNK // SYSTEM CLEANER</div>
+        <div class="card-tag" id="junkTag">—</div>
+      </div>
+      <div class="junk-card">
+        <div class="junk-summary">
+          <div class="junk-total-wrap">
+            <div class="junk-total-label">МУСОР К ОЧИСТКЕ</div>
+            <div class="junk-total" id="junkTotal">—<span class="unit">GB</span></div>
+            <div class="junk-meta" id="junkMeta">—</div>
+          </div>
+          <div>
+            <button class="btn-clean" id="btnClean" disabled>
+              <span class="icon">⚡</span>
+              <span>ОЧИСТИТЬ МУСОР</span>
+            </button>
+            <div class="btn-hint">
+              Безопасно чистит TEMP, кэши браузеров, корзину,<br>
+              отчёты об ошибках и кэш Windows Update.<br>
+              Системные файлы НЕ трогаются.
+            </div>
+            <div id="cleanProgress" class="clean-progress" style="display:none;">
+              <div class="cp-bar"><div class="cp-fill" id="cpFill"></div></div>
+              <div class="cp-footer">
+                <span class="cp-label" id="cpLabel">INITIALIZING...</span>
+                <span class="cp-elapsed" id="cpElapsed">00:00</span>
+              </div>
+            </div>
+          </div>
+          <div id="lastCleanBox"></div>
+        </div>
+        <div class="junk-categories-col">
+          <div class="junk-cats-head">КАТЕГОРИИ</div>
+          <div class="junk-list" id="junkList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div>CYBERFORTRESS // SYSTEM CONTROL · GEN <span id="genTime">—</span></div>
+    <div class="footer-links">
+      <span>◆</span> RAW: <code>system-data.js</code>
+      <span>◆</span> AUTO-RELOAD: <code id="reloadInterval">3s</code>
+      <span>◆</span> SAMPLES: <code id="sampleCount">0</code>
+    </div>
+  </div>
+
+</div>
+
+<!-- Boot screen if no data -->
+<div class="bootscreen" id="bootscreen" style="display:none;">
+  <div class="bootscreen-inner">
+    <div class="bootscreen-brand">
+      <span class="bootscreen-mark">⌬</span>
+      CYBERFORTRESS
+    </div>
+    <div class="bootscreen-spinner"></div>
+  </div>
+</div>
+
+<!-- Initial load (the script that the watcher rewrites) -->
+<script id="telemetry-script" src="system-data.js" onerror="document.getElementById('bootscreen').style.display='grid';"></script>
+
+<button class="scroll-top" id="scrollTop" title="Наверх" aria-label="Scroll to top">↑</button>
+
+<script src="dashboard.js"></script>
+
+</body>
+</html>
