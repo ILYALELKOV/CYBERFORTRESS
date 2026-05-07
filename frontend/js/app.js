@@ -1195,18 +1195,23 @@
   }
 
   function renderJunk(j) {
-    if (!j) {
-      $('junkTag').textContent = 'SCANNING...';
+    if (!j || j.status === 'scanning') {
+      $('junkTag').textContent = j?.status === 'scanning' ? 'СКАНИРОВАНИЕ...' : 'НЕ ПРОСКАНИРОВАНО';
       $('junkTotal').innerHTML = '—<span class="unit">GB</span>';
-      $('junkMeta').textContent = 'Сканирование при каждом запуске занимает ~5-10 сек.';
-      $('junkList').innerHTML = '<div class="empty">// JUNK DATA NOT YET COLLECTED</div>';
+      $('junkMeta').textContent = j?.status === 'scanning' ? 'Идёт первоначальный сбор данных...' : 'Нажми СКАНИРОВАТЬ для поиска мусора.';
+      $('junkList').innerHTML = '<div class="empty">// Нажми СКАНИРОВАТЬ чтобы начать</div>';
       $('btnClean').disabled = true;
+      $('btnScan').disabled = _isScanning;
       return;
     }
     const cats = Array.isArray(j.categories) ? j.categories : (j.categories ? [j.categories] : []);
     const flat = cats.flat ? cats.flat() : cats;
 
-    const total = j.total_bytes || 0;
+    // Compute total from category list; clamp negatives caused by COM int32 overflow
+    const total = flat.reduce((acc, c) => {
+      const sz = c.size_bytes || 0;
+      return acc + (sz < 0 ? sz + 4294967296 : sz); // recover uint32 wrap-around
+    }, 0);
     const totalShort = bytesShort(total);
     $('junkTotal').innerHTML = `${totalShort.v}<span class="unit">${totalShort.u}</span>`;
 
@@ -1214,24 +1219,24 @@
     $('junkTag').textContent = `${flat.length} cats · ${nonZero} non-empty`;
     $('junkMeta').innerHTML = `<b>${nonZero}</b> категорий с данными · скан: <b>${escape(j.scanned_at || '—')}</b>`;
 
-    if (!_isCleaning) $('btnClean').disabled = total < 1024 * 1024;
+    // Track all category IDs; auto-select non-empty ones on first scan result
+    const prevAllCount = _allCatIds.length;
+    _allCatIds = flat.map(c => c.id);
+    if (prevAllCount === 0 && flat.length > 0) {
+      // First population: select all non-empty by default
+      flat.forEach(c => { if ((c.size_bytes || 0) > 0) _selectedCats.add(c.id); });
+      _hasScanned = true;
+    } else {
+      // Remove IDs that no longer exist
+      [..._selectedCats].forEach(id => { if (!_allCatIds.includes(id)) _selectedCats.delete(id); });
+    }
+
+    _updateCleanBtn();
+    _updateSelToggle();
 
     // sort: largest first
     const sorted = [...flat].sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
-    $('junkList').innerHTML = sorted.map(c => {
-      const sz = bytesShort(c.size_bytes || 0);
-      const isZero = !(c.size_bytes && c.size_bytes > 0);
-      return `
-        <div class="junk-row${isZero ? ' empty' : ''}">
-          <div class="junk-icon">${escape(c.icon || '·')}</div>
-          <div class="junk-name">
-            <div class="n">${escape(c.name)}</div>
-            <div class="p">${escape(c.path)}</div>
-          </div>
-          <div class="junk-size${isZero ? ' zero' : ''}">${sz.v} ${sz.u}</div>
-        </div>
-      `;
-    }).join('');
+    $('junkList').innerHTML = _renderJunkRows(sorted);
 
     // last cleanup info
     const lc = j.last_cleanup;
@@ -1248,20 +1253,207 @@
     }
   }
 
+  /* ---- Category selection state ---------------------------------- */
+  const _browserCatIds = new Set(['browser_cache', 'browser_history']); // both need browser closed — Chrome locks History SQLite file while running
+  let _selectedCats    = new Set();   // IDs of checked categories
+  let _allCatIds       = [];          // ordered list of all non-empty cat IDs from last scan
+
+  function _updateCleanBtn() {
+    if (_isCleaning || _isScanning) return;
+    const hasSelection = _selectedCats.size > 0;
+    $('btnClean').disabled = !_hasScanned || !hasSelection;
+  }
+
+  function _updateSelToggle() {
+    const allBtn  = $('btnSelAll');
+    const noneBtn = $('btnSelNone');
+    if (!allBtn || !noneBtn) return;
+    const nonEmptyIds = _allCatIds.filter(id => {
+      const j = window.SYSTEM_DATA?.junk;
+      const cat = j?.categories?.flat?.()?.find?.(c => c.id === id) ||
+                  j?.categories?.find?.(c => c.id === id);
+      return cat && (cat.size_bytes || 0) > 0;
+    });
+    const allSelected  = nonEmptyIds.length > 0 && nonEmptyIds.every(id => _selectedCats.has(id));
+    const noneSelected = _selectedCats.size === 0;
+    allBtn.classList.toggle('active', allSelected);
+    noneBtn.classList.toggle('active', noneSelected);
+  }
+
+  function junkSelectAll(select) {
+    const j = window.SYSTEM_DATA?.junk;
+    if (!j) return;
+    const cats = (j.categories?.flat?.() || j.categories || []);
+    if (select) {
+      cats.forEach(c => { if ((c.size_bytes || 0) > 0) _selectedCats.add(c.id); });
+    } else {
+      _selectedCats.clear();
+    }
+    // Re-render rows with new selection
+    _refreshJunkRows();
+    _updateSelToggle();
+    _updateCleanBtn();
+  }
+
+  function _refreshJunkRows() {
+    const j = window.SYSTEM_DATA?.junk;
+    if (!j) return;
+    const cats = (j.categories?.flat?.() || j.categories || []);
+    const sorted = [...cats].sort((a, b) => (b.size_bytes || 0) - (a.size_bytes || 0));
+    $('junkList').innerHTML = _renderJunkRows(sorted);
+  }
+
+  function _renderJunkRows(sorted) {
+    return sorted.map(c => {
+      const sz      = bytesShort(c.size_bytes || 0);
+      const isZero  = !(c.size_bytes && c.size_bytes > 0);
+      const checked = _selectedCats.has(c.id);
+      return `
+        <div class="junk-row${isZero ? ' empty' : ''}${checked ? ' selected' : ''}" data-id="${escape(c.id)}">
+          <div class="junk-cb-wrap">
+            <span class="junk-cb-mark">${checked ? '✓' : ''}</span>
+          </div>
+          <div class="junk-icon">${escape(c.icon || '·')}</div>
+          <div class="junk-name">
+            <div class="n">${escape(c.name)}</div>
+            <div class="p">${escape(c.path)}</div>
+          </div>
+          <div class="junk-size${isZero ? ' zero' : ''}">${sz.v} ${sz.u}</div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  /* ---- Scan state machine ---------------------------------------- */
+  let _isScanning      = false;
+  let _scanTick        = null;
+  let _scanStart       = 0;
+  let _scanPrevTs      = null;
+  let _hasScanned      = false;
+
+  const _API_BASE = 'http://localhost:7779';
+
+  function _apiFetch(path, body) {
+    return fetch(_API_BASE + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }).catch(() => null);
+  }
+
+  function _fileSignal(filename, content) {
+    const blob = new Blob([content], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function _sendScanSignal() {
+    _apiFetch('/api/scan', { ts: Date.now() }).then(res => {
+      if (!res || !res.ok) _fileSignal('cybfortress_scan.signal', 'scan-' + Date.now());
+    });
+  }
+
+  function triggerScan() {
+    if (_isScanning || _isCleaning) return;
+    _isScanning  = true;
+    _scanStart   = Date.now();
+    _scanPrevTs  = window.SYSTEM_DATA?.junk?.scanned_at || null;
+
+    _sendScanSignal();
+
+    const btn  = $('btnScan');
+    const span = btn?.querySelector('span:last-child');
+    if (btn)  { btn.disabled = true; btn.classList.add('scanning'); }
+    if (span) span.textContent = 'СКАНИРОВАНИЕ...';
+    $('btnClean').disabled = true;
+    $('junkTag').textContent = 'СКАНИРОВАНИЕ...';
+    $('junkMeta').textContent = 'Идёт сбор данных, ~5-15 сек...';
+
+    _scanTick = setInterval(() => {
+      const curTs = window.SYSTEM_DATA?.junk?.scanned_at;
+      if (curTs && curTs !== _scanPrevTs) {
+        clearInterval(_scanTick); _scanTick = null;
+        _isScanning = false;
+        _hasScanned = true;
+        if (btn)  { btn.disabled = false; btn.classList.remove('scanning'); }
+        if (span) span.textContent = 'СКАНИРОВАТЬ';
+        const hasSelection = _selectedCats.size > 0;
+        $('btnClean').disabled = !hasSelection;
+        return;
+      }
+      if ((Date.now() - _scanStart) > 90000) {
+        clearInterval(_scanTick); _scanTick = null;
+        _isScanning = false;
+        if (btn)  { btn.disabled = false; btn.classList.remove('scanning'); }
+        if (span) span.textContent = 'СКАНИРОВАТЬ';
+      }
+    }, 1000);
+  }
+
+  /* ---- Browser-close warning modal ------------------------------- */
+  function showBrowserModal(onConfirm, onCancel) {
+    if ($('browserModal')) return;  // already open
+    const modal = document.createElement('div');
+    modal.id = 'browserModal';
+    modal.className = 'browser-modal';
+    let secs = 10;
+    modal.innerHTML = `
+      <div class="bm-box">
+        <div class="bm-title">⚠ ВНИМАНИЕ</div>
+        <div class="bm-body">
+          Браузер будет закрыт принудительно.<br>
+          После очистки открой его сам вручную.<br>
+          Авто-закрытие через <b id="bmCount">10</b> сек.<br><br>
+          <span style="color:var(--tx-mid);font-size:10px">Сохрани открытые вкладки заранее!</span>
+        </div>
+        <div class="bm-actions">
+          <button class="bm-cancel" id="bmCancel">ОТМЕНА</button>
+          <button class="bm-ok" id="bmOk">ЗАКРЫТЬ СЕЙЧАС</button>
+        </div>
+        <div class="bm-countdown"><div class="bm-bar" id="bmBar"></div></div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    const barEl   = modal.querySelector('#bmBar');
+    const countEl = modal.querySelector('#bmCount');
+    const timer   = setInterval(() => {
+      secs--;
+      if (countEl) countEl.textContent = secs;
+      if (barEl)   barEl.style.width = ((10 - secs) / 10 * 100) + '%';
+      if (secs <= 0) { clearInterval(timer); _removeBrowserModal(); onConfirm(); }
+    }, 1000);
+
+    modal.querySelector('#bmOk').addEventListener('click', () => {
+      clearInterval(timer); _removeBrowserModal(); onConfirm();
+    });
+    modal.querySelector('#bmCancel').addEventListener('click', () => {
+      clearInterval(timer); _removeBrowserModal(); if (onCancel) onCancel();
+    });
+  }
+  function _removeBrowserModal() {
+    const m = $('browserModal');
+    if (m) m.remove();
+  }
+
   /* ---- Cleaning state machine ------------------------------------ */
   let _isCleaning      = false;
   let _cleanTick       = null;
   let _cleanStart      = 0;
   let _cleanPrevTs     = null;   // last_cleanup.finished_at before this run
   let _cleanConfirmTmo = null;   // pending double-click confirm timer
+  let _cleanHasBrowser = false;  // whether browser categories are in current cleanup
 
   function _sendSignal() {
-    const blob = new Blob(['cleanup-' + Date.now()], { type: 'text/plain' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href = url; a.download = 'cybfortress_cleanup.signal';
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const cats     = [..._selectedCats];
+    const browsers = cats.length === 0 || cats.some(id => _browserCatIds.has(id));
+    const payload  = { ts: Date.now(), cats, browsers };
+    _apiFetch('/api/cleanup', payload).then(res => {
+      if (!res || !res.ok) _fileSignal('cybfortress_cleanup.signal', JSON.stringify(payload));
+    });
   }
 
   function _cpSetLabel(text) {
@@ -1272,6 +1464,8 @@
   function _cleanFinish() {
     clearInterval(_cleanTick); _cleanTick = null;
     _isCleaning = false;
+    _allCatIds = [];
+    _selectedCats.clear();
     const fill = $('cpFill');
     const lbl  = $('cpLabel');
     if (fill) fill.classList.add('done');
@@ -1296,10 +1490,11 @@
     if (el) el.textContent = `${mm}:${ss}`;
 
     // Честные фазовые метки — не врём о процентах
-    if      (elapsed <  8)  _cpSetLabel('ОЖИДАНИЕ UAC...');
-    else if (elapsed < 25)  _cpSetLabel('ЗАПУСК ОЧИСТКИ...');
-    else if (elapsed < 90)  _cpSetLabel('ОЧИСТКА ФАЙЛОВ...');
-    else if (elapsed < 240) _cpSetLabel('ГЛУБОКАЯ ОЧИСТКА...');
+    if      (elapsed <  5)  _cpSetLabel('ОЖИДАНИЕ UAC...');
+    else if (elapsed < 20)  _cpSetLabel(_cleanHasBrowser ? 'ЗАКРЫТИЕ БРАУЗЕРОВ...' : 'ЗАПУСК ОЧИСТКИ...');
+    else if (elapsed < 40)  _cpSetLabel('ОЧИСТКА ФАЙЛОВ...');
+    else if (elapsed < 100) _cpSetLabel('ОЧИСТКА ФАЙЛОВ...');
+    else if (elapsed < 250) _cpSetLabel('ГЛУБОКАЯ ОЧИСТКА...');
     else                    _cpSetLabel('ФИНАЛИЗАЦИЯ...');
 
     // Детектор завершения: timestamp last_cleanup изменился
@@ -1320,9 +1515,31 @@
 
   function triggerCleanup() {
     if (_isCleaning) return;
-    _isCleaning  = true;
-    _cleanStart  = Date.now();
-    _cleanPrevTs = window.SYSTEM_DATA?.junk?.last_cleanup?.finished_at || null;
+    const cats       = [..._selectedCats];
+    const hasBrowser = cats.length === 0 || cats.some(id => _browserCatIds.has(id));
+    if (hasBrowser) {
+      showBrowserModal(
+        () => _doCleanup(),
+        () => {
+          const btn = $('btnClean');
+          if (btn) {
+            btn.disabled = false;
+            const s = btn.querySelector('span:last-child');
+            if (s) s.textContent = 'ОЧИСТИТЬ МУСОР';
+          }
+        }
+      );
+    } else {
+      _doCleanup();
+    }
+  }
+
+  function _doCleanup() {
+    if (_isCleaning) return;
+    _isCleaning      = true;
+    _cleanStart      = Date.now();
+    _cleanPrevTs     = window.SYSTEM_DATA?.junk?.last_cleanup?.finished_at || null;
+    _cleanHasBrowser = _selectedCats.size === 0 || [..._selectedCats].some(id => _browserCatIds.has(id));
 
     _sendSignal();
 
@@ -1368,12 +1585,40 @@
         applyTheme(cur === 'light' ? 'dark' : 'light');
       });
     }
+    const scanBtn = $('btnScan');
+    if (scanBtn) {
+      scanBtn.addEventListener('click', () => triggerScan());
+    }
+
+    // Category row click → toggle selection
+    const junkList = $('junkList');
+    if (junkList) {
+      junkList.addEventListener('click', e => {
+        const row = e.target.closest('.junk-row');
+        if (!row || row.classList.contains('empty')) return;
+        const id = row.dataset.id;
+        if (!id) return;
+        if (_selectedCats.has(id)) _selectedCats.delete(id);
+        else _selectedCats.add(id);
+        row.classList.toggle('selected', _selectedCats.has(id));
+        const mark = row.querySelector('.junk-cb-mark');
+        if (mark) mark.textContent = _selectedCats.has(id) ? '✓' : '';
+        _updateSelToggle();
+        _updateCleanBtn();
+      });
+    }
+
+    const selAllBtn = $('btnSelAll');
+    if (selAllBtn) selAllBtn.addEventListener('click', () => junkSelectAll(true));
+    const selNoneBtn = $('btnSelNone');
+    if (selNoneBtn) selNoneBtn.addEventListener('click', () => junkSelectAll(false));
+
     const cleanBtn = $('btnClean');
     if (cleanBtn) {
       cleanBtn.addEventListener('click', () => {
-        if (_isCleaning) return;
+        if (_isCleaning || _isScanning) return;
         if (_cleanConfirmTmo) {
-          // Second click within 3 s → go
+          // Second click within 3 s → show browser modal → go
           clearTimeout(_cleanConfirmTmo); _cleanConfirmTmo = null;
           const s = cleanBtn.querySelector('span:last-child');
           if (s) s.textContent = 'ОЧИСТИТЬ МУСОР';

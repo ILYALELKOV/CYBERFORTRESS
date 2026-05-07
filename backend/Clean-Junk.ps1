@@ -11,12 +11,22 @@ param(
     [switch]$DryRun,
     # Remove hiberfil.sys (= RAM size, e.g. 16-32 GB). Disables hibernate + fast-startup.
     # Re-enable anytime: powercfg /h on
-    [switch]$DisableHibernate
+    [switch]$DisableHibernate,
+    # Comma-separated category IDs to clean. Empty = clean everything.
+    [string]$CategoriesStr = '',
+    # Close and reopen browsers automatically before browser-related cleanup.
+    [switch]$CloseBrowsers
 )
 
 $ErrorActionPreference = 'Continue'
 $ProgressPreference    = 'SilentlyContinue'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+$_cats = if ($CategoriesStr) { $CategoriesStr -split ',' | ForEach-Object { $_.Trim() } } else { @() }
+function Should-Clean([string]$id) {
+    # Empty list = run all (backward-compat). Otherwise only run if ID is in the list.
+    return ($_cats.Count -eq 0 -or $_cats -contains $id)
+}
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -65,7 +75,8 @@ function Format-Bytes {
 # Clean a folder's CONTENTS (not the folder itself).
 # Returns result hashtable.
 function Clear-FolderContents {
-    param([string]$Path, [switch]$DryRun, [string]$Label = '')
+    # MinAgeHours = 0 bypasses age filter (e.g. browser history files you always want gone)
+    param([string]$Path, [switch]$DryRun, [string]$Label = '', [int]$MinAgeHours = 0)
     $r = @{
         path          = $Path
         label         = $Label
@@ -82,7 +93,10 @@ function Clear-FolderContents {
     $r.size_before = Get-FolderSize $Path
 
     if (-not $DryRun) {
+        $cutoff = (Get-Date).AddHours(-$MinAgeHours)
         Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            # Skip items newer than MinAgeHours (like top tools — CCleaner, ASC do the same)
+            if ($MinAgeHours -gt 0 -and $_.LastWriteTime -gt $cutoff) { return }
             try {
                 Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
                 $r.files_removed++
@@ -142,6 +156,86 @@ function Clear-SingleFile {
     return $r
 }
 
+# Delete browser history files from a profile folder but preserve Cookies, Login Data, Bookmarks.
+# Returns aggregated result hashtable.
+function Clear-BrowserHistory {
+    param([string]$ProfilePath, [switch]$DryRun, [string]$BrowserLabel)
+    $agg = @{ path=$ProfilePath; label="$BrowserLabel History"; existed=$false
+              size_before=[int64]0; size_after=[int64]0; freed_bytes=[int64]0
+              files_removed=0; errors=0 }
+    if (-not (Test-Path $ProfilePath)) { return $agg }
+    $agg.existed = $true
+
+    # Individual history files — always delete regardless of age (MinAgeHours=0)
+    $histFiles = @(
+        'History','History-journal','Visited Links','Top Sites','Favicons',
+        'Media History','Download Metadata','Network Action Predictor',
+        'Shortcuts','QuotaManager'
+    )
+    foreach ($f in $histFiles) {
+        $fp = Join-Path $ProfilePath $f
+        if (-not (Test-Path $fp)) { continue }
+        try {
+            $fi = Get-Item -LiteralPath $fp -Force -ErrorAction Stop
+            $agg.size_before += $fi.Length
+            $agg.existed = $true
+            if (-not $DryRun) {
+                Remove-Item -LiteralPath $fp -Force -ErrorAction Stop
+                $agg.files_removed++
+                $agg.freed_bytes += $fi.Length
+            } else { $agg.freed_bytes += $fi.Length }
+        } catch { $agg.errors++ }
+    }
+    # History sub-folders
+    $histFolders = @('Session Storage', 'Service Worker\CacheStorage', 'Service Worker\ScriptCache')
+    foreach ($sub in $histFolders) {
+        $fp = Join-Path $ProfilePath $sub
+        if (-not (Test-Path $fp)) { continue }
+        $sub_r = Clear-FolderContents -Path $fp -DryRun:$DryRun -Label "$BrowserLabel $(Split-Path $sub -Leaf)" -MinAgeHours 0
+        $agg.size_before  += [int64]$sub_r.size_before
+        $agg.freed_bytes  += [int64]$sub_r.freed_bytes
+        $agg.files_removed += [int]$sub_r.files_removed
+        $agg.errors       += [int]$sub_r.errors
+    }
+    $agg.size_after = [math]::Max([int64]0, $agg.size_before - $agg.freed_bytes)
+    return $agg
+}
+
+# Kill browsers and wait until all processes are fully gone (file handles released).
+function Stop-Browsers {
+    $browserNames = @('chrome','msedge','firefox','brave','vivaldi','opera','operagx')
+    $killed = $false
+    foreach ($name in $browserNames) {
+        $procs = @(Get-Process -Name $name -ErrorAction SilentlyContinue)
+        if ($procs.Count -eq 0) { continue }
+        & taskkill /F /IM "$name.exe" /T 2>$null | Out-Null
+        $killed = $true
+        Write-Host ("  [BROWSER] Killed: $name ($($procs.Count) process(es))") -ForegroundColor Yellow
+    }
+    if ($killed) {
+        # Wait until every browser process is actually gone (up to 15 sec)
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 15) {
+            $still = $browserNames | Where-Object { Get-Process -Name $_ -ErrorAction SilentlyContinue }
+            if (-not $still) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        Start-Sleep -Milliseconds 500   # extra settle for file handle release
+        Write-Host "  [BROWSER] All browser processes gone." -ForegroundColor Green
+    }
+    return @()   # never reopen — history sync would restore it
+}
+
+function Start-Browsers {
+    param([string[]]$ExePaths)
+    foreach ($path in $ExePaths) {
+        try {
+            Start-Process -FilePath $path -ErrorAction SilentlyContinue
+            Write-Host ("  [BROWSER] Reopened: $path") -ForegroundColor Green
+        } catch { }
+    }
+}
+
 # Stop a service safely with timeout — Stop-Service blocks indefinitely if service is busy
 function Stop-ServiceSafe {
     param([string]$Name, [int]$TimeoutSec = 10)
@@ -165,18 +259,21 @@ function Start-ServiceSafe {
     }
 }
 
-# Recycle Bin via Shell.Application COM
 function Clear-RecycleBinSafe {
     param([switch]$DryRun)
     $r = @{ path='Recycle Bin'; label='Recycle Bin'; existed=$true
-            size_before=0; size_after=0; freed_bytes=0; files_removed=0; errors=0 }
+            size_before=[int64]0; size_after=[int64]0; freed_bytes=[int64]0; files_removed=0; errors=0 }
     try {
-        $shell = New-Object -ComObject Shell.Application
-        $bin   = $shell.Namespace(0xA)
-        if ($bin -and $bin.Items()) {
-            foreach ($it in $bin.Items()) { $r.size_before += [int64]$it.Size; $r.files_removed++ }
+        $sid   = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $drives = [System.IO.DriveInfo]::GetDrives() |
+            Where-Object { $_.IsReady -and $_.DriveType -eq [System.IO.DriveType]::Fixed }
+        foreach ($drv in $drives) {
+            $bp = Join-Path $drv.RootDirectory.FullName "`$Recycle.Bin\$sid"
+            if (Test-Path -LiteralPath $bp) {
+                $r.size_before += Get-FolderSize $bp
+                $r.files_removed += ([System.IO.Directory]::EnumerateFiles($bp, '*', [System.IO.SearchOption]::AllDirectories) | Measure-Object).Count
+            }
         }
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
     } catch { $r.errors++ }
 
     if (-not $DryRun) {
@@ -348,136 +445,147 @@ Write-Host ""
 # ============================================================================
 # 1. USER TEMP
 # ============================================================================
-Write-Host "-- User-level items ----------------------------" -ForegroundColor DarkGray
-$r = Clear-FolderContents -Path $env:TEMP -DryRun:$DryRun -Label 'User Temp (%TEMP%)'
-$results += $r; Write-Row $r 'User Temp'
-
-$localTemp = "$env:LOCALAPPDATA\Temp"
-if ($localTemp -ne $env:TEMP) {
-    $r = Clear-FolderContents -Path $localTemp -DryRun:$DryRun -Label 'LocalAppData\Temp'
-    $results += $r; Write-Row $r 'LocalAppData Temp'
+if (Should-Clean 'user_temp') {
+    Write-Host "-- User-level items ----------------------------" -ForegroundColor DarkGray
+    $r = Clear-FolderContents -Path $env:TEMP -DryRun:$DryRun -Label 'User Temp (%TEMP%)'
+    $results += $r; Write-Row $r 'User Temp'
+    $localTemp = "$env:LOCALAPPDATA\Temp"
+    if ($localTemp -ne $env:TEMP) {
+        $r = Clear-FolderContents -Path $localTemp -DryRun:$DryRun -Label 'LocalAppData\Temp'
+        $results += $r; Write-Row $r 'LocalAppData Temp'
+    }
 }
 
 # ============================================================================
 # 2. WINDOWS ERROR REPORTING
 # ============================================================================
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Microsoft\Windows\WER" -DryRun:$DryRun -Label 'Windows Error Reports'
-$results += $r; Write-Row $r 'WER'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\CrashDumps" -DryRun:$DryRun -Label 'App Crash Dumps'
-$results += $r; Write-Row $r 'CrashDumps'
-
-# Global WER dumps
-$r = Clear-FolderContents -Path "$env:ProgramData\Microsoft\Windows\WER\ReportQueue" -DryRun:$DryRun -Label 'WER Report Queue'
-$results += $r; Write-Row $r 'WER Queue'
-
-$r = Clear-FolderContents -Path "$env:ProgramData\Microsoft\Windows\WER\ReportArchive" -DryRun:$DryRun -Label 'WER Report Archive'
-$results += $r; Write-Row $r 'WER Archive'
+if (Should-Clean 'error_reports') {
+    $r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Microsoft\Windows\WER" -DryRun:$DryRun -Label 'Windows Error Reports' -MinAgeHours 24
+    $results += $r; Write-Row $r 'WER'
+    $r = Clear-FolderContents -Path "$env:LOCALAPPDATA\CrashDumps" -DryRun:$DryRun -Label 'App Crash Dumps' -MinAgeHours 24
+    $results += $r; Write-Row $r 'CrashDumps'
+    $r = Clear-FolderContents -Path "$env:ProgramData\Microsoft\Windows\WER\ReportQueue" -DryRun:$DryRun -Label 'WER Report Queue' -MinAgeHours 24
+    $results += $r; Write-Row $r 'WER Queue'
+    $r = Clear-FolderContents -Path "$env:ProgramData\Microsoft\Windows\WER\ReportArchive" -DryRun:$DryRun -Label 'WER Report Archive' -MinAgeHours 24
+    $results += $r; Write-Row $r 'WER Archive'
+}
 
 # ============================================================================
-# 3. BROWSER CACHES
+# 3. BROWSER CLEANUP (cache + history, cookies preserved)
 # ============================================================================
-Write-Host "-- Browser caches ------------------------------" -ForegroundColor DarkGray
-
-$chromeBase = "$env:LOCALAPPDATA\Google\Chrome\User Data"
-foreach ($p in (Get-BrowserCachePaths $chromeBase 'Default\Cache')) {
-    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Chrome Cache'
-    $results += $r; Write-Row $r 'Chrome Cache'
-}
-foreach ($p in (Get-BrowserCachePaths $chromeBase 'Default\Code Cache')) {
-    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Chrome Code Cache'
-    $results += $r; Write-Row $r 'Chrome Code Cache'
-}
-foreach ($p in (Get-BrowserCachePaths $chromeBase 'Default\GPUCache')) {
-    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Chrome GPU Cache'
-    $results += $r; Write-Row $r 'Chrome GPU Cache'
+# Helper: enumerate all Chromium profiles under a base dir
+function Get-ChromiumProfiles {
+    param([string]$Base)
+    $profiles = @()
+    if (-not (Test-Path $Base)) { return $profiles }
+    $profiles += Join-Path $Base 'Default'
+    Get-ChildItem -LiteralPath $Base -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^Profile \d+$' } |
+        ForEach-Object { $profiles += $_.FullName }
+    return $profiles | Where-Object { Test-Path $_ }
 }
 
-$edgeBase = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"
-foreach ($p in (Get-BrowserCachePaths $edgeBase 'Default\Cache')) {
-    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Edge Cache'
-    $results += $r; Write-Row $r 'Edge Cache'
-}
-foreach ($p in (Get-BrowserCachePaths $edgeBase 'Default\Code Cache')) {
-    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Edge Code Cache'
-    $results += $r; Write-Row $r 'Edge Code Cache'
-}
-foreach ($p in (Get-BrowserCachePaths $edgeBase 'Default\GPUCache')) {
-    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Edge GPU Cache'
-    $results += $r; Write-Row $r 'Edge GPU Cache'
-}
+if (Should-Clean 'browser_cache' -or Should-Clean 'browser_history') {
+    Write-Host "-- Browser cleanup (closing browsers...) ------" -ForegroundColor DarkGray
+    # Close browsers only if the CloseBrowsers flag was passed (frontend sends it when browser cats are selected)
+    if (-not $DryRun -and $CloseBrowsers) { Stop-Browsers | Out-Null }
 
-# Firefox: profile in %APPDATA%\Mozilla\Firefox\Profiles\*\cache2
-$ffBase = "$env:APPDATA\Mozilla\Firefox\Profiles"
-if (Test-Path $ffBase) {
-    Get-ChildItem -LiteralPath $ffBase -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        $ffCache = Join-Path $_.FullName 'cache2'
-        if (Test-Path $ffCache) {
-            $r = Clear-FolderContents -Path $ffCache -DryRun:$DryRun -Label 'Firefox Cache'
-            $results += $r; Write-Row $r 'Firefox Cache'
+    foreach ($entry in @(
+        @{ base="$env:LOCALAPPDATA\Google\Chrome\User Data";           label='Chrome' },
+        @{ base="$env:LOCALAPPDATA\Microsoft\Edge\User Data";          label='Edge' },
+        @{ base="$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"; label='Brave' }
+    )) {
+        foreach ($prof in (Get-ChromiumProfiles $entry.base)) {
+            if (Should-Clean 'browser_cache') {
+                foreach ($sub in @('Cache','Code Cache','GPUCache')) {
+                    $p = Join-Path $prof $sub
+                    $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label "$($entry.label) $sub" -MinAgeHours 0
+                    $results += $r; Write-Row $r "$($entry.label) $sub"
+                }
+            }
+            if (Should-Clean 'browser_history') {
+                $r = Clear-BrowserHistory -ProfilePath $prof -DryRun:$DryRun -BrowserLabel $entry.label
+                $results += $r; Write-Row $r "$($entry.label) History"
+            }
         }
     }
-}
 
-# IE / Edge Legacy WebCache
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Microsoft\Windows\INetCache" -DryRun:$DryRun -Label 'INetCache (IE/Edge)'
-$results += $r; Write-Row $r 'INetCache'
+    # Firefox
+    $ffBase = "$env:APPDATA\Mozilla\Firefox\Profiles"
+    if (Test-Path $ffBase) {
+        Get-ChildItem -LiteralPath $ffBase -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            if (Should-Clean 'browser_cache') {
+                foreach ($sub in @('cache2','startupCache','shader-cache')) {
+                    $p = Join-Path $_.FullName $sub
+                    if (Test-Path $p) {
+                        $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label "Firefox $sub" -MinAgeHours 0
+                        $results += $r; Write-Row $r "Firefox $sub"
+                    }
+                }
+            }
+        }
+    }
+
+    if (Should-Clean 'browser_cache') {
+        $r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Microsoft\Windows\INetCache" -DryRun:$DryRun -Label 'INetCache (IE/Edge)' -MinAgeHours 0
+        $results += $r; Write-Row $r 'INetCache'
+    }
+
+    Write-Host "-- Browser cleanup done (reopen manually) ------" -ForegroundColor DarkGray
+}
 
 # ============================================================================
 # 4. GRAPHICS / DIRECTX SHADER CACHE
 # ============================================================================
-Write-Host "-- Graphics caches -----------------------------" -ForegroundColor DarkGray
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\D3DSCache" -DryRun:$DryRun -Label 'D3D Shader Cache'
-$results += $r; Write-Row $r 'D3DSCache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\NVIDIA\DXCache" -DryRun:$DryRun -Label 'NVIDIA DX Cache'
-$results += $r; Write-Row $r 'NVIDIA DXCache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\NVIDIA\GLCache" -DryRun:$DryRun -Label 'NVIDIA GL Cache'
-$results += $r; Write-Row $r 'NVIDIA GLCache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\AMD\DxCache" -DryRun:$DryRun -Label 'AMD DX Cache'
-$results += $r; Write-Row $r 'AMD DxCache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\AMD\GLCache" -DryRun:$DryRun -Label 'AMD GL Cache'
-$results += $r; Write-Row $r 'AMD GLCache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Intel\ShaderCache" -DryRun:$DryRun -Label 'Intel Shader Cache'
-$results += $r; Write-Row $r 'Intel ShaderCache'
+if (Should-Clean 'gpu_cache') {
+    Write-Host "-- Graphics caches -----------------------------" -ForegroundColor DarkGray
+    foreach ($p in @(
+        @{p="$env:LOCALAPPDATA\D3DSCache";           l='D3D Shader Cache'},
+        @{p="$env:LOCALAPPDATA\NVIDIA\DXCache";       l='NVIDIA DX Cache'},
+        @{p="$env:LOCALAPPDATA\NVIDIA\GLCache";       l='NVIDIA GL Cache'},
+        @{p="$env:LOCALAPPDATA\AMD\DxCache";          l='AMD DX Cache'},
+        @{p="$env:LOCALAPPDATA\AMD\GLCache";          l='AMD GL Cache'},
+        @{p="$env:LOCALAPPDATA\Intel\ShaderCache";    l='Intel Shader Cache'}
+    )) {
+        $r = Clear-FolderContents -Path $p.p -DryRun:$DryRun -Label $p.l
+        $results += $r; Write-Row $r $p.l
+    }
+}
 
 # ============================================================================
 # 5. THUMBNAIL CACHE
 # ============================================================================
-Write-Host "-- Thumbnail cache -----------------------------" -ForegroundColor DarkGray
-$thumbDir = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
-if (Test-Path $thumbDir) {
-    $r = @{ path=$thumbDir; label='Thumbnail Cache'; existed=$true; size_before=0; size_after=0; freed_bytes=0; files_removed=0; errors=0 }
-    if (-not $DryRun) {
-        # Explorer must not be running its cache — just delete the db files
-        Get-ChildItem -LiteralPath $thumbDir -Filter 'thumbcache_*.db' -Force -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $r.size_before += $_.Length
-                try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $r.files_removed++; $r.freed_bytes += $_.Length }
-                catch { $r.errors++ }
-            }
-        Get-ChildItem -LiteralPath $thumbDir -Filter 'iconcache_*.db' -Force -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                $r.size_before += $_.Length
-                try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $r.files_removed++; $r.freed_bytes += $_.Length }
-                catch { $r.errors++ }
-            }
-    } else {
-        Get-ChildItem -LiteralPath $thumbDir -Filter '*.db' -Force -ErrorAction SilentlyContinue |
-            ForEach-Object { $r.size_before += $_.Length; $r.files_removed++ }
-        $r.freed_bytes = $r.size_before
+if (Should-Clean 'thumbnails') {
+    Write-Host "-- Thumbnail cache -----------------------------" -ForegroundColor DarkGray
+    $thumbDir = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
+    if (Test-Path $thumbDir) {
+        $r = @{ path=$thumbDir; label='Thumbnail Cache'; existed=$true; size_before=0; size_after=0; freed_bytes=0; files_removed=0; errors=0 }
+        if (-not $DryRun) {
+            Get-ChildItem -LiteralPath $thumbDir -Filter 'thumbcache_*.db' -Force -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $r.size_before += $_.Length
+                    try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $r.files_removed++; $r.freed_bytes += $_.Length }
+                    catch { $r.errors++ }
+                }
+            Get-ChildItem -LiteralPath $thumbDir -Filter 'iconcache_*.db' -Force -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $r.size_before += $_.Length
+                    try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $r.files_removed++; $r.freed_bytes += $_.Length }
+                    catch { $r.errors++ }
+                }
+        } else {
+            Get-ChildItem -LiteralPath $thumbDir -Filter '*.db' -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { $r.size_before += $_.Length; $r.files_removed++ }
+            $r.freed_bytes = $r.size_before
+        }
+        $results += $r; Write-Row $r 'Thumbnails'
     }
-    $results += $r; Write-Row $r 'Thumbnails'
 }
 
 # ============================================================================
 # 6. APP CACHES — Teams, Discord, Spotify, VS Code, Telegram, Office
 # ============================================================================
+if (Should-Clean 'app_cache') {
 Write-Host "-- App caches ----------------------------------" -ForegroundColor DarkGray
 
 # Microsoft Teams (new Teams stores under WindowsApps, classic under LocalAppData)
@@ -563,263 +671,264 @@ if (Test-Path "$env:LOCALAPPDATA\Adobe") {
         }
     }
 }
+} # end app_cache
+
+# Steam cache — htmlcache (Steam browser), logs, dumps
+if (Should-Clean 'steam_cache') {
+    Write-Host "-- Steam cache ---------------------------------" -ForegroundColor DarkGray
+    $steamPaths = @("$env:LOCALAPPDATA\Steam\htmlcache","$env:LOCALAPPDATA\Steam\logs")
+    $steamInstall = ''
+    try { $steamInstall = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath } catch { }
+    if (-not $steamInstall) { $steamInstall = 'C:\Program Files (x86)\Steam' }
+    $steamPaths += "$steamInstall\logs","$steamInstall\dumps"
+    $shadersPath = Join-Path $steamInstall 'shadercache'
+    if (Test-Path $shadersPath) { $steamPaths += $shadersPath }
+    foreach ($p in ($steamPaths | Select-Object -Unique)) {
+        if (Test-Path $p) {
+            $r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label "Steam $(Split-Path $p -Leaf)"
+            $results += $r; Write-Row $r "Steam $(Split-Path $p -Leaf)"
+        }
+    }
+}
 
 # ============================================================================
 # 6b. DEV TOOL CACHES — npm, pip, NuGet, Yarn, Maven
 # ============================================================================
-Write-Host "-- Dev tool caches -----------------------------" -ForegroundColor DarkGray
+if (Should-Clean 'dev_cache') {
+    Write-Host "-- Dev tool caches -----------------------------" -ForegroundColor DarkGray
+    foreach ($entry in @(
+        @{p="$env:LOCALAPPDATA\npm-cache";          l='npm cache'},
+        @{p="$env:APPDATA\npm-cache";               l='npm cache (Roaming)'},
+        @{p="$env:LOCALAPPDATA\pip\Cache";           l='pip Cache'},
+        @{p="$env:LOCALAPPDATA\NuGet\Cache";         l='NuGet Cache'},
+        @{p="$env:LOCALAPPDATA\NuGet\v3-cache";      l='NuGet v3 Cache'},
+        @{p="$env:LOCALAPPDATA\Yarn\Cache";          l='Yarn Cache'},
+        @{p="$env:LOCALAPPDATA\Temp\NuGetScratch";   l='.NET NuGet Scratch'}
+    )) {
+        $r = Clear-FolderContents -Path $entry.p -DryRun:$DryRun -Label $entry.l
+        $results += $r; Write-Row $r $entry.l
+    }
+}
 
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\npm-cache" -DryRun:$DryRun -Label 'npm cache'
-$results += $r; Write-Row $r 'npm cache'
-
-$r = Clear-FolderContents -Path "$env:APPDATA\npm-cache" -DryRun:$DryRun -Label 'npm cache (Roaming)'
-$results += $r; Write-Row $r 'npm cache (R)'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\pip\Cache" -DryRun:$DryRun -Label 'pip Cache'
-$results += $r; Write-Row $r 'pip Cache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\NuGet\Cache" -DryRun:$DryRun -Label 'NuGet Cache'
-$results += $r; Write-Row $r 'NuGet Cache'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\NuGet\v3-cache" -DryRun:$DryRun -Label 'NuGet v3 Cache'
-$results += $r; Write-Row $r 'NuGet v3'
-
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Yarn\Cache" -DryRun:$DryRun -Label 'Yarn Cache'
-$results += $r; Write-Row $r 'Yarn Cache'
-
-# .NET SDK temp
-$r = Clear-FolderContents -Path "$env:LOCALAPPDATA\Temp\NuGetScratch" -DryRun:$DryRun -Label '.NET NuGet Scratch'
-$results += $r; Write-Row $r 'NuGet Scratch'
+# ============================================================================
+# 6c. EXTENDED AREAS — CCleaner / Advanced SystemCare best practices
+# ============================================================================
+if (Should-Clean 'extended') {
+    Write-Host "-- Extended cleanup areas ----------------------" -ForegroundColor DarkGray
+    foreach ($entry in @(
+        @{p="$env:APPDATA\Microsoft\Windows\Recent";                              l='Recent Documents'},
+        @{p="$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations";        l='Jump Lists (Auto)'},
+        @{p="$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations";           l='Jump Lists (Custom)'},
+        @{p="$env:USERPROFILE\AppData\LocalLow\Sun\Java\Deployment\cache";        l='Java Cache'},
+        @{p="$env:APPDATA\Microsoft\Windows Media Player";                        l='WMP History'},
+        @{p="$env:TEMP\chocolatey";                                               l='Chocolatey Cache'},
+        @{p="$env:WINDIR\SoftwareDistribution\DeliveryOptimization";              l='Delivery Opt Extra'}
+    )) {
+        $r = Clear-FolderContents -Path $entry.p -DryRun:$DryRun -Label $entry.l
+        $results += $r; Write-Row $r $entry.l
+    }
+    # Microsoft Store / UWP app temp folders
+    $pkgBase = "$env:LOCALAPPDATA\Packages"
+    if (Test-Path $pkgBase) {
+        $storeFreed = [int64]0; $storeFiles = 0; $storeErrors = 0
+        Get-ChildItem -LiteralPath $pkgBase -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Join-Path $_.FullName 'AC\Temp'
+            if (Test-Path $p) {
+                $sub_r = Clear-FolderContents -Path $p -DryRun:$DryRun -Label 'Store Temp'
+                $storeFreed += [int64]$sub_r.freed_bytes; $storeFiles += [int]$sub_r.files_removed; $storeErrors += [int]$sub_r.errors
+            }
+        }
+        $storeR = @{ path=$pkgBase; label='MS Store App Temp'; existed=($storeFreed -gt 0 -or $storeFiles -gt 0)
+                     size_before=$storeFreed; size_after=[int64]0; freed_bytes=$storeFreed
+                     files_removed=$storeFiles; errors=$storeErrors }
+        $results += $storeR; Write-Row $storeR 'Store App Temp'
+    }
+}
 
 # ============================================================================
 # 7. SYSTEM-LEVEL (needs admin)
 # ============================================================================
 Write-Host "-- System-level --------------------------------" -ForegroundColor DarkGray
 
-$r = Clear-FolderContents -Path "$env:WINDIR\Temp" -DryRun:$DryRun -Label 'Windows\Temp'
-$results += $r; Write-Row $r 'Windows Temp'
-
-$r = Clear-FolderContents -Path "$env:WINDIR\Prefetch" -DryRun:$DryRun -Label 'Prefetch'
-$results += $r; Write-Row $r 'Prefetch'
-
-$r = Clear-FolderContents -Path "$env:WINDIR\Minidump" -DryRun:$DryRun -Label 'Minidump files'
-$results += $r; Write-Row $r 'Minidump'
-
-$memDump = "$env:WINDIR\memory.dmp"
-$r = Clear-SingleFile -Path $memDump -DryRun:$DryRun -Label 'Memory dump (memory.dmp)'
-$results += $r; Write-Row $r 'memory.dmp'
-
-# CBS archive logs — CbsPersist_*.log only (active CbsPersist.log is always locked by TrustedInstaller)
-$cbsPath = "$env:WINDIR\Logs\CBS"
-$cbsR = @{ path=$cbsPath; label='CBS Archive Logs'; existed=(Test-Path $cbsPath -ErrorAction SilentlyContinue)
-           size_before=[int64]0; size_after=[int64]0; freed_bytes=[int64]0; files_removed=0; errors=0 }
-if ($cbsR.existed) {
-    Get-ChildItem -LiteralPath $cbsPath -Filter 'CbsPersist_*' -Force -ErrorAction SilentlyContinue | ForEach-Object {
-        $cbsR.size_before += [int64]$_.Length
-        if (-not $DryRun) {
-            try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $cbsR.files_removed++; $cbsR.freed_bytes += [int64]$_.Length }
-            catch { $cbsR.errors++ }
-        } else { $cbsR.files_removed++ }
-    }
-    if ($DryRun) { $cbsR.freed_bytes = $cbsR.size_before }
+if (Should-Clean 'windows_temp') {
+    $r = Clear-FolderContents -Path "$env:WINDIR\Temp" -DryRun:$DryRun -Label 'Windows\Temp'
+    $results += $r; Write-Row $r 'Windows Temp'
 }
-$results += $cbsR; Write-Row $cbsR 'CBS Archive Logs'
-
-# CBS Temp — servicing temp packages (separate from Logs, can be 0-2 GB)
-$r = Clear-FolderContents -Path "$env:WINDIR\CbsTemp" -DryRun:$DryRun -Label 'CBS Temp'
-$results += $r; Write-Row $r 'CBS Temp'
-
-# Windows Setup/Upgrade logs — safe after successful upgrade
-$r = Clear-FolderContents -Path "$env:WINDIR\Panther" -DryRun:$DryRun -Label 'Windows Setup Logs'
-$results += $r; Write-Row $r 'Panther'
-
-# Windows Defender scan history (Threat History in Security UI — safe, Defender recreates)
-$r = Clear-FolderContents -Path "$env:ProgramData\Microsoft\Windows Defender\Scans\History" -DryRun:$DryRun -Label 'Defender Scan History'
-$results += $r; Write-Row $r 'Defender History'
-
-# Windows Installer patch cache — huge, safe (installers already applied)
-$r = Clear-FolderContents -Path "$env:WINDIR\Installer\`$PatchCache`$" -DryRun:$DryRun -Label 'Installer PatchCache'
-$results += $r; Write-Row $r 'Installer PatchCache'
-
-# Windows.old — leftover from OS upgrade, can be 10-30 GB
-$winOld = 'C:\Windows.old'
-if (Test-Path $winOld) {
-    $winOldSize = Get-FolderSize $winOld
-    Write-Host ("[~] {0,-28}" -f 'Windows.old') -NoNewline -ForegroundColor Yellow
-    Write-Host (" SIZE: {0}  -- removing old OS backup..." -f (Format-Bytes $winOldSize)) -ForegroundColor Yellow
-    if (-not $DryRun -and $isAdmin) {
-        try {
-            # takeown/icacls with 2-minute timeout each — can be slow on large directories
-            $p1 = Start-Process 'takeown.exe' -ArgumentList "/F `"$winOld`" /R /D Y" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
-            if ($p1) { $p1.WaitForExit(120000) | Out-Null; if (-not $p1.HasExited) { try { $p1.Kill() } catch {} } }
-            $p2 = Start-Process 'icacls.exe'  -ArgumentList "`"$winOld`" /grant administrators:F /T" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
-            if ($p2) { $p2.WaitForExit(120000) | Out-Null; if (-not $p2.HasExited) { try { $p2.Kill() } catch {} } }
-            Remove-Item -LiteralPath $winOld -Recurse -Force -ErrorAction SilentlyContinue
-        } catch { }
-    }
-    $winOldAfter = Get-FolderSize $winOld
-    $r = @{ path=$winOld; label='Windows.old'; existed=$true
-            size_before=[int64]$winOldSize; size_after=[int64]$winOldAfter
-            freed_bytes=[int64]([math]::Max([int64]0,[int64]$winOldSize-[int64]$winOldAfter))
-            files_removed=0; errors=0 }
-    $results += $r
+if (Should-Clean 'prefetch') {
+    $r = Clear-FolderContents -Path "$env:WINDIR\Prefetch" -DryRun:$DryRun -Label 'Prefetch'
+    $results += $r; Write-Row $r 'Prefetch'
 }
-
-# Font Cache — stop service, delete cache, restart
-Write-Host "-- Font cache ----------------------------------" -ForegroundColor DarkGray
-$fontCachePrev = Stop-ServiceSafe 'FontCache'
-if (-not $DryRun -and $isAdmin) { Start-Sleep -Milliseconds 600 }
-$r = Clear-FolderContents -Path "$env:WINDIR\ServiceProfiles\LocalService\AppData\Local\FontCache" -DryRun:$DryRun -Label 'Font Cache'
-$results += $r; Write-Row $r 'FontCache'
-# FontCache-S-1-5-18 subfolder
-$r = Clear-FolderContents -Path "$env:WINDIR\ServiceProfiles\LocalService\AppData\Local\FontCache-S-1-5-18" -DryRun:$DryRun -Label 'FontCache-System'
-$results += $r; Write-Row $r 'FontCache-System'
-Start-ServiceSafe 'FontCache' $fontCachePrev
+if (Should-Clean 'system_junk') {
+    $r = Clear-FolderContents -Path "$env:WINDIR\Minidump" -DryRun:$DryRun -Label 'Minidump files' -MinAgeHours 24
+    $results += $r; Write-Row $r 'Minidump'
+    $r = Clear-SingleFile -Path "$env:WINDIR\memory.dmp" -DryRun:$DryRun -Label 'Memory dump (memory.dmp)'
+    $results += $r; Write-Row $r 'memory.dmp'
+    $cbsPath = "$env:WINDIR\Logs\CBS"
+    $cbsR = @{ path=$cbsPath; label='CBS Archive Logs'; existed=(Test-Path $cbsPath -ErrorAction SilentlyContinue)
+               size_before=[int64]0; size_after=[int64]0; freed_bytes=[int64]0; files_removed=0; errors=0 }
+    if ($cbsR.existed) {
+        Get-ChildItem -LiteralPath $cbsPath -Filter 'CbsPersist_*' -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            $cbsR.size_before += [int64]$_.Length
+            if (-not $DryRun) {
+                try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $cbsR.files_removed++; $cbsR.freed_bytes += [int64]$_.Length }
+                catch { $cbsR.errors++ }
+            } else { $cbsR.files_removed++ }
+        }
+        if ($DryRun) { $cbsR.freed_bytes = $cbsR.size_before }
+    }
+    $results += $cbsR; Write-Row $cbsR 'CBS Archive Logs'
+    foreach ($entry in @(
+        @{p="$env:WINDIR\CbsTemp";          l='CBS Temp'},
+        @{p="$env:WINDIR\Panther";           l='Windows Setup Logs'},
+        @{p="$env:ProgramData\Microsoft\Windows Defender\Scans\History"; l='Defender Scan History'},
+        @{p="$env:WINDIR\Installer\`$PatchCache`$"; l='Installer PatchCache'}
+    )) {
+        $r = Clear-FolderContents -Path $entry.p -DryRun:$DryRun -Label $entry.l
+        $results += $r; Write-Row $r $entry.l
+    }
+}
+if (Should-Clean 'windows_old') {
+    $winOld = 'C:\Windows.old'
+    if (Test-Path $winOld) {
+        $winOldSize = Get-FolderSize $winOld
+        Write-Host ("[~] {0,-28} SIZE: {1}  -- removing..." -f 'Windows.old', (Format-Bytes $winOldSize)) -ForegroundColor Yellow
+        if (-not $DryRun -and $isAdmin) {
+            try {
+                $p1 = Start-Process 'takeown.exe' -ArgumentList "/F `"$winOld`" /R /D Y" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+                if ($p1) { $p1.WaitForExit(120000) | Out-Null; if (-not $p1.HasExited) { try { $p1.Kill() } catch {} } }
+                $p2 = Start-Process 'icacls.exe'  -ArgumentList "`"$winOld`" /grant administrators:F /T" -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue
+                if ($p2) { $p2.WaitForExit(120000) | Out-Null; if (-not $p2.HasExited) { try { $p2.Kill() } catch {} } }
+                Remove-Item -LiteralPath $winOld -Recurse -Force -ErrorAction SilentlyContinue
+            } catch { }
+        }
+        $winOldAfter = Get-FolderSize $winOld
+        $r = @{ path=$winOld; label='Windows.old'; existed=$true
+                size_before=[int64]$winOldSize; size_after=[int64]$winOldAfter
+                freed_bytes=[int64]([math]::Max([int64]0,[int64]$winOldSize-[int64]$winOldAfter)); files_removed=0; errors=0 }
+        $results += $r
+    }
+}
+if (Should-Clean 'system_junk') {
+    Write-Host "-- Font cache ----------------------------------" -ForegroundColor DarkGray
+    $fontCachePrev = Stop-ServiceSafe 'FontCache'
+    if (-not $DryRun -and $isAdmin) { Start-Sleep -Milliseconds 600 }
+    $r = Clear-FolderContents -Path "$env:WINDIR\ServiceProfiles\LocalService\AppData\Local\FontCache" -DryRun:$DryRun -Label 'Font Cache'
+    $results += $r; Write-Row $r 'FontCache'
+    $r = Clear-FolderContents -Path "$env:WINDIR\ServiceProfiles\LocalService\AppData\Local\FontCache-S-1-5-18" -DryRun:$DryRun -Label 'FontCache-System'
+    $results += $r; Write-Row $r 'FontCache-System'
+    Start-ServiceSafe 'FontCache' $fontCachePrev
+}
 
 # ============================================================================
 # 7. WINDOWS UPDATE DOWNLOAD CACHE
-# Safely: stop wuauserv + bits, delete, restart.
 # ============================================================================
-Write-Host "-- Windows Update cache ------------------------" -ForegroundColor DarkGray
-$wuPath = "$env:WINDIR\SoftwareDistribution\Download"
-$wuPrev = ''; $bitsPrev = ''
-if (-not $DryRun -and $isAdmin) {
-    Write-Host "  Stopping Windows Update service..." -ForegroundColor DarkGray
-    $wuPrev   = Stop-ServiceSafe 'wuauserv'
-    $bitsPrev = Stop-ServiceSafe 'bits'
-    Start-Sleep -Milliseconds 800
+if (Should-Clean 'windows_update') {
+    Write-Host "-- Windows Update cache ------------------------" -ForegroundColor DarkGray
+    $wuPath = "$env:WINDIR\SoftwareDistribution\Download"
+    $wuPrev = ''; $bitsPrev = ''
+    if (-not $DryRun -and $isAdmin) {
+        Write-Host "  Stopping Windows Update service..." -ForegroundColor DarkGray
+        $wuPrev   = Stop-ServiceSafe 'wuauserv'
+        $bitsPrev = Stop-ServiceSafe 'bits'
+        Start-Sleep -Milliseconds 800
+    }
+    $r = Clear-FolderContents -Path $wuPath -DryRun:$DryRun -Label 'WU Download Cache'
+    $results += $r; Write-Row $r 'SoftwareDistribution'
+    $r = Clear-FolderContents -Path "$env:WINDIR\SoftwareDistribution\DataStore\Logs" -DryRun:$DryRun -Label 'WU DataStore Logs'
+    $results += $r; Write-Row $r 'WU DataStore Logs'
+    if (-not $DryRun -and $isAdmin) { Start-ServiceSafe 'wuauserv' $wuPrev; Start-ServiceSafe 'bits' $bitsPrev }
+    $doPath = "$env:WINDIR\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
+    $r = Clear-FolderContents -Path $doPath -DryRun:$DryRun -Label 'Delivery Optimization'
+    $results += $r; Write-Row $r 'DeliveryOptimization'
+    $r = Clear-FolderContents -Path "$env:WINDIR\Logs\WindowsUpdate" -DryRun:$DryRun -Label 'WU Log Files'
+    $results += $r; Write-Row $r 'WU Logs'
 }
-$r = Clear-FolderContents -Path $wuPath -DryRun:$DryRun -Label 'WU Download Cache'
-$results += $r; Write-Row $r 'SoftwareDistribution'
-
-# DataStore transaction logs — also safe while WU is stopped
-$r = Clear-FolderContents -Path "$env:WINDIR\SoftwareDistribution\DataStore\Logs" -DryRun:$DryRun -Label 'WU DataStore Logs'
-$results += $r; Write-Row $r 'WU DataStore Logs'
-
-if (-not $DryRun -and $isAdmin) {
-    Start-ServiceSafe 'wuauserv' $wuPrev
-    Start-ServiceSafe 'bits'    $bitsPrev
-}
-
-# Delivery Optimization cache
-$doPath = "$env:WINDIR\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache"
-$r = Clear-FolderContents -Path $doPath -DryRun:$DryRun -Label 'Delivery Optimization'
-$results += $r; Write-Row $r 'DeliveryOptimization'
-
-# Windows Update log files
-$r = Clear-FolderContents -Path "$env:WINDIR\Logs\WindowsUpdate" -DryRun:$DryRun -Label 'WU Log Files'
-$results += $r; Write-Row $r 'WU Logs'
 
 # ============================================================================
 # 8. RECYCLE BIN
 # ============================================================================
-Write-Host "-- Recycle Bin ---------------------------------" -ForegroundColor DarkGray
-$rb = Clear-RecycleBinSafe -DryRun:$DryRun
-$results += $rb; Write-Row $rb 'Recycle Bin'
+if (Should-Clean 'recycle_bin') {
+    Write-Host "-- Recycle Bin ---------------------------------" -ForegroundColor DarkGray
+    $rb = Clear-RecycleBinSafe -DryRun:$DryRun
+    $results += $rb; Write-Row $rb 'Recycle Bin'
+}
 
 # ============================================================================
 # 9. SYSTEM LOG FILES
 # ============================================================================
-Write-Host "-- System log files ----------------------------" -ForegroundColor DarkGray
-
-# Windows system log files (IIS, HTTPERR, etc.)
-$r = Clear-FolderContents -Path "$env:WINDIR\System32\LogFiles" -DryRun:$DryRun -Label 'System LogFiles'
-$results += $r; Write-Row $r 'System LogFiles'
-
-# Windows debug logs
-$r = Clear-FolderContents -Path "$env:WINDIR\debug" -DryRun:$DryRun -Label 'Windows Debug Logs'
-$results += $r; Write-Row $r 'Debug Logs'
-
-# IIS logs (if IIS installed)
-$r = Clear-FolderContents -Path "$env:SystemDrive\inetpub\logs\LogFiles" -DryRun:$DryRun -Label 'IIS Logs'
-$results += $r; Write-Row $r 'IIS Logs'
+if (Should-Clean 'system_logs') {
+    Write-Host "-- System log files ----------------------------" -ForegroundColor DarkGray
+    foreach ($entry in @(
+        @{p="$env:WINDIR\System32\LogFiles";               l='System LogFiles'},
+        @{p="$env:WINDIR\debug";                           l='Windows Debug Logs'},
+        @{p="$env:SystemDrive\inetpub\logs\LogFiles";      l='IIS Logs'}
+    )) {
+        $r = Clear-FolderContents -Path $entry.p -DryRun:$DryRun -Label $entry.l
+        $results += $r; Write-Row $r $entry.l
+    }
+}
 
 # ============================================================================
 # 10. WINDOWS EVENT LOGS
-# Safe: logs are for diagnostics only, cleared automatically at size limit anyway.
 # ============================================================================
-Write-Host "-- Event logs ----------------------------------" -ForegroundColor DarkGray
-# Only the 4 main logs — iterating all 500-1000 channels takes several minutes
-$evtMainLogs = @('Application','System','Security','Setup')
-if (-not $DryRun -and $isAdmin) {
-    $evtBefore = [int64]0
-    $evtCount  = 0
-    Get-WinEvent -ListLog $evtMainLogs -ErrorAction SilentlyContinue | ForEach-Object {
-        try { $evtBefore += [int64]$_.FileSize } catch { }
+if (Should-Clean 'event_logs') {
+    Write-Host "-- Event logs ----------------------------------" -ForegroundColor DarkGray
+    $evtMainLogs = @('Application','System','Security','Setup')
+    if (-not $DryRun -and $isAdmin) {
+        $evtBefore = [int64]0; $evtCount = 0
+        Get-WinEvent -ListLog $evtMainLogs -ErrorAction SilentlyContinue | ForEach-Object { try { $evtBefore += [int64]$_.FileSize } catch { } }
+        foreach ($logName in $evtMainLogs) { try { [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($logName); $evtCount++ } catch { } }
+        $evtAfter = [int64]0
+        Get-WinEvent -ListLog $evtMainLogs -ErrorAction SilentlyContinue | ForEach-Object { try { $evtAfter += [int64]$_.FileSize } catch { } }
+        $evtR = @{ path='EventLogs'; label='Windows Event Logs'; existed=$true
+                   size_before=$evtBefore; size_after=$evtAfter; freed_bytes=[math]::Max([int64]0,$evtBefore-$evtAfter)
+                   files_removed=$evtCount; errors=0 }
+        $results += $evtR; Write-Row $evtR 'EventLogs'
+    } elseif ($DryRun) {
+        $evtSize = [int64]0
+        Get-WinEvent -ListLog $evtMainLogs -ErrorAction SilentlyContinue | ForEach-Object { try { $evtSize += [int64]$_.FileSize } catch { } }
+        $evtR = @{ path='EventLogs'; label='Windows Event Logs'; existed=$true
+                   size_before=$evtSize; size_after=0; freed_bytes=$evtSize; files_removed=0; errors=0 }
+        $results += $evtR; Write-Row $evtR 'EventLogs'
+    } else {
+        Write-Host ("[~] {0,-28} (requires Administrator)" -f 'Windows Event Logs') -ForegroundColor DarkGray
     }
-    foreach ($logName in $evtMainLogs) {
+} # end event_logs
+
+# ============================================================================
+# 11. VSS SHADOW COPIES
+# ============================================================================
+if (Should-Clean 'vss') {
+    Write-Host "-- VSS Shadow Copies ---------------------------" -ForegroundColor DarkGray
+    function Get-VssUsedBytes {
+        $total = [int64]0
+        try { Get-WmiObject -Query "SELECT UsedSpace FROM Win32_ShadowStorage" -ErrorAction SilentlyContinue | ForEach-Object { $total += [int64]$_.UsedSpace } } catch {}
+        return $total
+    }
+    if ($isAdmin -and -not $DryRun) {
         try {
-            [System.Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.ClearLog($logName)
-            $evtCount++
-        } catch { }
-    }
-    $evtAfter = [int64]0
-    Get-WinEvent -ListLog $evtMainLogs -ErrorAction SilentlyContinue | ForEach-Object {
-        try { $evtAfter += [int64]$_.FileSize } catch { }
-    }
-    $evtFreed = [math]::Max([int64]0, $evtBefore - $evtAfter)
-    $evtR = @{ path='EventLogs'; label='Windows Event Logs'; existed=$true
-               size_before=$evtBefore; size_after=$evtAfter; freed_bytes=$evtFreed
-               files_removed=$evtCount; errors=0 }
-    $results += $evtR; Write-Row $evtR 'EventLogs'
-} elseif ($DryRun) {
-    $evtSize = [int64]0
-    Get-WinEvent -ListLog $evtMainLogs -ErrorAction SilentlyContinue | ForEach-Object {
-        try { $evtSize += [int64]$_.FileSize } catch { }
-    }
-    $evtR = @{ path='EventLogs'; label='Windows Event Logs'; existed=$true
-               size_before=$evtSize; size_after=0; freed_bytes=$evtSize
-               files_removed=0; errors=0 }
-    $results += $evtR; Write-Row $evtR 'EventLogs'
-} else {
-    Write-Host ("[~] {0,-28} (requires Administrator)" -f 'Windows Event Logs') -ForegroundColor DarkGray
-}
-
-# ============================================================================
-# 11. VSS SHADOW COPIES — keep only the latest restore point, delete the rest.
-# Frees 1-10 GB. Safe: you still have 1 restore point for emergency rollback.
-# ============================================================================
-Write-Host "-- VSS Shadow Copies ---------------------------" -ForegroundColor DarkGray
-
-function Get-VssUsedBytes {
-    # Win32_ShadowStorage is language-independent and accessible as admin
-    $total = [int64]0
-    try {
-        Get-WmiObject -Query "SELECT UsedSpace FROM Win32_ShadowStorage" -ErrorAction SilentlyContinue |
-            ForEach-Object { $total += [int64]$_.UsedSpace }
-    } catch {}
-    return $total
-}
-
-if ($isAdmin -and -not $DryRun) {
-    try {
-        $shadows = @(Get-WmiObject Win32_ShadowCopy -ErrorAction SilentlyContinue)
-        if ($shadows.Count -gt 1) {
-            $vssBefore = Get-VssUsedBytes
-            $sorted   = $shadows | Sort-Object InstallDate -Descending
-            $toDelete = $sorted | Select-Object -Skip 1
-            $delCount = 0
-            foreach ($s in $toDelete) {
-                try { $s.Delete() | Out-Null; $delCount++ } catch { }
+            $shadows = @(Get-WmiObject Win32_ShadowCopy -ErrorAction SilentlyContinue)
+            if ($shadows.Count -gt 1) {
+                $vssBefore = Get-VssUsedBytes
+                $toDelete  = $shadows | Sort-Object InstallDate -Descending | Select-Object -Skip 1
+                $delCount  = 0
+                foreach ($s in $toDelete) { try { $s.Delete() | Out-Null; $delCount++ } catch { } }
+                Start-Sleep -Seconds 3
+                $vssAfter = Get-VssUsedBytes
+                $vssR = @{ path='VSS'; label="VSS (kept 1, removed $delCount)"; existed=$true
+                           size_before=$vssBefore; size_after=$vssAfter; freed_bytes=[math]::Max([int64]0,$vssBefore-$vssAfter)
+                           files_removed=$delCount; errors=0 }
+                $results += $vssR; Write-Row $vssR 'VSS ShadowCopy'
+            } elseif ($shadows.Count -eq 1) {
+                Write-Host ("[~] {0,-28} only 1 restore point, keeping it." -f 'VSS ShadowCopy') -ForegroundColor DarkGray
+            } else {
+                Write-Host ("[~] {0,-28} no shadow copies found." -f 'VSS ShadowCopy') -ForegroundColor DarkGray
             }
-            Start-Sleep -Seconds 3   # allow VSS to reclaim
-            $vssAfter  = Get-VssUsedBytes
-            $vssFreed  = [math]::Max([int64]0, $vssBefore - $vssAfter)
-            $vssR = @{ path='VSS'; label="VSS (kept 1, removed $delCount)"; existed=$true
-                       size_before=$vssBefore; size_after=$vssAfter; freed_bytes=$vssFreed
-                       files_removed=$delCount; errors=0 }
-            $results += $vssR; Write-Row $vssR 'VSS ShadowCopy'
-        } elseif ($shadows.Count -eq 1) {
-            Write-Host ("[~] {0,-28} only 1 restore point, keeping it." -f 'VSS ShadowCopy') -ForegroundColor DarkGray
-        } else {
-            Write-Host ("[~] {0,-28} no shadow copies found." -f 'VSS ShadowCopy') -ForegroundColor DarkGray
-        }
-    } catch {
-        Write-Host ("[~] {0,-28} error: $_" -f 'VSS ShadowCopy') -ForegroundColor Yellow
+        } catch { Write-Host ("[~] {0,-28} error: $_" -f 'VSS ShadowCopy') -ForegroundColor Yellow }
+    } else {
+        Write-Host ("[~] {0,-28} $(if ($DryRun) { 'DryRun mode' } else { 'requires Administrator' })" -f 'VSS ShadowCopy') -ForegroundColor DarkGray
     }
-} else {
-    Write-Host ("[~] {0,-28} $(if ($DryRun) { 'DryRun mode' } else { 'requires Administrator' })" -f 'VSS ShadowCopy') -ForegroundColor DarkGray
-}
+} # end vss
 
 # ============================================================================
 # 12. HIBERFIL.SYS — removes file equal to RAM size (16-32 GB on most systems).
@@ -871,6 +980,50 @@ if ($isAdmin -and -not $DryRun) {
 } else {
     Write-Host "-- WinSxS component cleanup --------------------" -ForegroundColor DarkGray
     Write-Host "  [DISM] Skipped: requires Administrator." -ForegroundColor DarkGray
+}
+
+# ============================================================================
+# EMPTY FOLDERS
+# ============================================================================
+if (Should-Clean 'empty_folders') {
+    Write-Host "-- Empty folders -------------------------------" -ForegroundColor DarkGray
+    $emptyRoots = @(
+        $env:TEMP,
+        "$env:LOCALAPPDATA\Temp",
+        "$env:USERPROFILE\Documents",
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Desktop",
+        "$env:USERPROFILE\Pictures",
+        "$env:USERPROFILE\Videos"
+    )
+    $efCount = 0; $efErrors = 0
+    $swEf = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($root in $emptyRoots) {
+        if (-not (Test-Path $root)) { continue }
+        try {
+            # Sort descending so deepest dirs are deleted first (parent becomes empty after child removed)
+            $dirs = Get-ChildItem -LiteralPath $root -Recurse -Directory -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending
+            foreach ($d in $dirs) {
+                if ($swEf.Elapsed.TotalSeconds -gt 20) { break }
+                try {
+                    $hasItems = [bool]([System.IO.Directory]::EnumerateFileSystemEntries($d.FullName) | Select-Object -First 1)
+                    if (-not $hasItems) {
+                        if (-not $DryRun) {
+                            Remove-Item -LiteralPath $d.FullName -Force -ErrorAction Stop
+                        }
+                        $efCount++
+                    }
+                } catch { $efErrors++ }
+            }
+        } catch { }
+        if ($swEf.Elapsed.TotalSeconds -gt 20) { break }
+    }
+    $swEf.Stop()
+    $efR = @{ path='Empty Folders'; label='Empty Folders'; existed=($efCount -gt 0 -or $efErrors -gt 0)
+              size_before=[int64]0; size_after=[int64]0; freed_bytes=[int64]0
+              files_removed=$efCount; errors=$efErrors }
+    $results += $efR; Write-Row $efR 'Empty Folders'
 }
 
 # ============================================================================

@@ -55,6 +55,21 @@ try {
 } catch { }
 
 # ----------------------------------------------------------------------------
+# Синхронизированный кэш для фонового Runspace (тяжёлые операции).
+# Основной цикл читает из него мгновенно, без блокировки.
+# ----------------------------------------------------------------------------
+$script:bgCache = [System.Collections.Hashtable]::Synchronized(@{})
+$script:bgCache['junk']        = @{ status='scanning'; scanned_at=''; total_bytes=0; total_categories=0; categories=,@() }
+$script:bgCache['releases']    = @{ status='scanning'; scanned_at=''; items=,@() }
+$script:bgCache['updates']     = @{ status='scanning'; scanned_at=''; available=0; critical=0; items=,@() }
+$script:bgCache['sysErrors']   = @{ status='scanning'; scanned_at=''; count=0; items=,@() }
+$script:bgCache['forceJunk']   = $false
+$script:bgCache['githubToken'] = ''
+$script:bgCache['rootDir']     = ''
+$script:bgRunspace   = $null
+$script:bgPowerShell = $null
+
+# ----------------------------------------------------------------------------
 # Загрузка .env (KEY=VALUE построчно, # — комментарий)
 # ----------------------------------------------------------------------------
 function Load-Env {
@@ -857,16 +872,19 @@ function Get-FolderSize {
 }
 
 function Get-RecycleBinSize {
+    $total = [int64]0
     try {
-        $shell = New-Object -ComObject Shell.Application
-        $bin = $shell.Namespace(0xA)
-        $sum = 0
-        if ($bin -and $bin.Items()) {
-            foreach ($item in $bin.Items()) { $sum += [int64]$item.Size }
+        $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $drives = [System.IO.DriveInfo]::GetDrives() |
+            Where-Object { $_.IsReady -and $_.DriveType -eq [System.IO.DriveType]::Fixed }
+        foreach ($drv in $drives) {
+            $binPath = Join-Path $drv.RootDirectory.FullName "`$Recycle.Bin\$sid"
+            if (Test-Path -LiteralPath $binPath) {
+                $total += Get-FolderSize $binPath
+            }
         }
-        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
-        return [int64]$sum
-    } catch { return 0 }
+    } catch { }
+    return $total
 }
 
 function Get-JunkInfo {
@@ -953,12 +971,59 @@ function Get-JunkInfo {
     $apaths.Add("$env:LOCALAPPDATA\Spotify\Storage")
     $apaths.Add("$env:LOCALAPPDATA\Spotify\Data")
     foreach ($sub in @('Cache','Code Cache','GPUCache','logs')) { $apaths.Add("$env:APPDATA\Code\$sub") }
-    $apaths.Add("$env:APPDATA\Telegram Desktop\tdata\user_data\cache")
-    $apaths.Add("$env:APPDATA\Telegram Desktop\tdata\user_data\media_cache")
+    # Telegram — enumerate all account hash-dirs under tdata\
+    $tdataPath = "$env:APPDATA\Telegram Desktop\tdata"
+    if (Test-Path $tdataPath) {
+        Get-ChildItem -LiteralPath $tdataPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            foreach ($cacheSub in @('cache','media_cache','cache2')) {
+                $cp = Join-Path $_.FullName $cacheSub
+                if (Test-Path $cp) { $apaths.Add($cp) }
+            }
+        }
+    }
     Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Office" -Directory -ErrorAction SilentlyContinue |
         ForEach-Object { $p = Join-Path $_.FullName 'OfficeFileCache'; if (Test-Path $p) { $apaths.Add($p) } }
     $cats += @{ id='app_cache'; name='App Cache'; icon='A'; path='Teams/Discord/Spotify/VSCode/Telegram'
                 size_bytes=(Measure-Paths $apaths.ToArray()) }
+
+    # 7b. Steam Cache
+    $steamInstall = ''
+    try { $steamInstall = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath } catch { }
+    if (-not $steamInstall) { $steamInstall = 'C:\Program Files (x86)\Steam' }
+    $steamPaths = @(
+        "$env:LOCALAPPDATA\Steam\htmlcache",
+        "$env:LOCALAPPDATA\Steam\logs",
+        "$steamInstall\logs",
+        "$steamInstall\dumps",
+        "$steamInstall\shadercache"
+    )
+    $steamSz = Measure-Paths $steamPaths
+    if ($steamSz -gt 0) {
+        $cats += @{ id='steam_cache'; name='Steam Cache'; icon='S'; path='Steam logs/htmlcache/shadercache'
+                    size_bytes=$steamSz }
+    }
+
+    # 7c. Browser History (separate from cache — shows history size)
+    $bhpaths = [System.Collections.Generic.List[string]]::new()
+    $histFiles = @('History','Visited Links','Top Sites','Favicons','Media History','Session Storage')
+    foreach ($base in @("$env:LOCALAPPDATA\Google\Chrome\User Data","$env:LOCALAPPDATA\Microsoft\Edge\User Data","$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data")) {
+        if (-not (Test-Path $base)) { continue }
+        $profs = @("$base\Default") + @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^Profile \d+$' } | ForEach-Object { $_.FullName })
+        foreach ($prof in $profs) {
+            foreach ($hf in $histFiles) {
+                $fp = Join-Path $prof $hf
+                if (Test-Path $fp) { $bhpaths.Add($fp) }
+            }
+        }
+    }
+    $bhSz = [int64]0
+    foreach ($fp in $bhpaths) {
+        try { $bhSz += [System.IO.FileInfo]::new($fp).Length } catch { }
+    }
+    if ($bhSz -gt 0) {
+        $cats += @{ id='browser_history'; name='Browser History'; icon='H'; path='Chrome/Edge/Brave history files'
+                    size_bytes=$bhSz }
+    }
 
     # 8. Dev Tools Cache (npm + pip + NuGet + Yarn)
     $cats += @{ id='dev_cache'; name='Dev Tools Cache'; icon='D'; path='npm/pip/NuGet/Yarn'
@@ -969,6 +1034,24 @@ function Get-JunkInfo {
                     "$env:LOCALAPPDATA\NuGet\Cache",
                     "$env:LOCALAPPDATA\NuGet\v3-cache",
                     "$env:LOCALAPPDATA\Yarn\Cache")) }
+
+    # 9b. Extended areas (CCleaner / Advanced SystemCare best practices)
+    $extPaths = [System.Collections.Generic.List[string]]::new()
+    $extPaths.Add("$env:APPDATA\Microsoft\Windows\Recent")
+    $extPaths.Add("$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations")
+    $extPaths.Add("$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations")
+    $extPaths.Add("$env:USERPROFILE\AppData\LocalLow\Sun\Java\Deployment\cache")
+    $extPaths.Add("$env:APPDATA\Microsoft\Windows Media Player")
+    $extPaths.Add("$env:TEMP\chocolatey")
+    # MS Store app temp
+    if (Test-Path "$env:LOCALAPPDATA\Packages") {
+        Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Packages" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Join-Path $_.FullName 'AC\Temp'
+            if (Test-Path $p) { $extPaths.Add($p) }
+        }
+    }
+    $cats += @{ id='extended'; name='Extended Areas'; icon='X'; path='Recent/JumpLists/Java/StoreTemp'
+                size_bytes=(Measure-Paths $extPaths.ToArray()) }
 
     # 9. Prefetch
     $cats += @{ id='prefetch'; name='Prefetch'; icon='P'; path="$env:WINDIR\Prefetch"
@@ -1024,8 +1107,41 @@ function Get-JunkInfo {
     $cats += @{ id='recycle_bin'; name='Recycle Bin'; icon='R'; path='$Recycle.Bin'
                 size_bytes=(Get-RecycleBinSize) }
 
+    # 17. Empty Folders (search in user dirs + temp with 6-second timeout)
+    $emptyCount = 0
+    $emptyRoots = @(
+        $env:TEMP,
+        "$env:LOCALAPPDATA\Temp",
+        "$env:USERPROFILE\Documents",
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Desktop",
+        "$env:USERPROFILE\Pictures",
+        "$env:USERPROFILE\Videos"
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    foreach ($root in $emptyRoots) {
+        if (-not (Test-Path $root)) { continue }
+        try {
+            Get-ChildItem -LiteralPath $root -Recurse -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                if ($sw.Elapsed.TotalSeconds -gt 6) { return }
+                try {
+                    $hasItems = [bool]([System.IO.Directory]::EnumerateFileSystemEntries($_.FullName) | Select-Object -First 1)
+                    if (-not $hasItems) { $emptyCount++ }
+                } catch { }
+            }
+        } catch { }
+        if ($sw.Elapsed.TotalSeconds -gt 6) { break }
+    }
+    $sw.Stop()
+    if ($emptyCount -gt 0) {
+        $cats += @{ id='empty_folders'; name="Empty Folders ($emptyCount)"; icon='∅'
+                    path='Documents/Downloads/Desktop/Temp'; size_bytes=[int64]0 }
+    }
+
     $total = [int64]0
-    foreach ($c in $cats) { $total += [int64]$c.size_bytes }
+    foreach ($c in $cats) {
+        try { $total += [int64]($c.size_bytes) } catch { }
+    }
     $totalCount = ($cats | Where-Object { $_.size_bytes -gt 0 }).Count
 
     $lastCleanLog = $null
@@ -1354,26 +1470,24 @@ function Build-DataSnapshot {
         $synology = Get-SynologyInfo -Cfg $Cfg.synology
     }
 
-    # Тяжёлые сканы — на первом цикле пропускаем, snapshot появляется быстро.
-    if ($script:firstSnapshotDone) {
+    # Тяжёлые данные читаем из фонового кэша — никакой блокировки основного цикла.
+    # В режиме одиночного запуска (без -Watch) bgCache ещё не наполнен,
+    # поэтому запускаем их синхронно для обратной совместимости.
+    if ($script:bgRunspace) {
+        $junk      = $script:bgCache['junk']
+        $releases  = $script:bgCache['releases']
+        $updates   = $script:bgCache['updates']
+        $sysErrors = $script:bgCache['sysErrors']
+    } else {
         Write-Host "[+] Junk scan..." -ForegroundColor Cyan
         $junk = Get-JunkInfo
-
         Write-Host "[+] GitHub releases..." -ForegroundColor Cyan
-        $token = ''
-        if ($Cfg.PSObject.Properties['github_token']) { $token = [string]$Cfg.github_token }
+        $token = ''; if ($Cfg.PSObject.Properties['github_token']) { $token = [string]$Cfg.github_token }
         $releases = Get-ReleasesInfo -Token $token
-
         Write-Host "[+] Windows Updates..." -ForegroundColor Cyan
         $updates = Get-WindowsUpdatesInfo
-
         Write-Host "[+] System errors..." -ForegroundColor Cyan
         $sysErrors = Get-SystemErrors
-    } else {
-        $junk     = @{ scanned_at=''; total_bytes=0; total_categories=0; categories=,@(); status='scanning' }
-        $releases = @{ scanned_at=''; items=,@(); status='scanning' }
-        $updates  = @{ scanned_at=''; available=$null; critical=0; items=,@(); status='scanning' }
-        $sysErrors= @{ scanned_at=''; count=0; items=,@(); status='scanning' }
     }
 
     $rigaUrl = ''
@@ -1411,41 +1525,174 @@ function Build-DataSnapshot {
 }
 
 # ----------------------------------------------------------------------------
+# HTTP API (localhost:7779) — надёжная альтернатива file-download сигналам.
+# Фронтенд делает POST /api/scan или POST /api/cleanup (JSON body).
+# ----------------------------------------------------------------------------
+$script:httpListener    = $null
+$script:apiPort         = 7779
+$script:httpAsyncResult = $null   # IAsyncResult from BeginGetContext
+
+function Start-HttpApi {
+    try {
+        $l = [System.Net.HttpListener]::new()
+        $l.Prefixes.Add("http://localhost:$($script:apiPort)/")
+        $l.Start()
+        $script:httpListener = $l
+        # Kick off first async receive
+        $script:httpAsyncResult = $l.BeginGetContext($null, $null)
+        Write-Host "[HTTP] API listening on http://localhost:$($script:apiPort)/" -ForegroundColor Cyan
+    } catch {
+        Write-Host "[HTTP] Could not start API listener: $_" -ForegroundColor DarkGray
+    }
+}
+
+function Stop-HttpApi {
+    if ($script:httpListener) {
+        try { $script:httpListener.Stop(); $script:httpListener.Close() } catch { }
+        $script:httpListener    = $null
+        $script:httpAsyncResult = $null
+    }
+}
+
+function _Http-HandleContext {
+    param($ctx)
+    $req = $ctx.Request
+    $res = $ctx.Response
+    try {
+        $res.AddHeader('Access-Control-Allow-Origin',  '*')
+        $res.AddHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS')
+        $res.AddHeader('Access-Control-Allow-Headers', 'Content-Type')
+
+        $path   = $req.Url.AbsolutePath.ToLower()
+        $method = $req.HttpMethod.ToUpper()
+        $body   = $null
+        if ($req.HasEntityBody) {
+            try {
+                $reader = [System.IO.StreamReader]::new($req.InputStream)
+                $raw    = $reader.ReadToEnd()
+                $reader.Close()
+                if ($raw) { $body = $raw | ConvertFrom-Json }
+            } catch { }
+        }
+
+        $statusCode   = 200
+        $responseText = '{"ok":true}'
+
+        if ($method -eq 'OPTIONS') {
+            # CORS preflight — headers already set, just respond 200
+        } elseif ($path -eq '/api/scan') {
+            Write-Host "[HTTP] /api/scan received" -ForegroundColor Cyan
+            $script:bgCache['forceJunk'] = $true
+            $script:lastJunkCheck = [DateTime]::MinValue
+        } elseif ($path -eq '/api/cleanup') {
+            Write-Host "[HTTP] /api/cleanup received" -ForegroundColor Yellow
+            Invoke-CleanupFromPayload -Payload $body
+        } else {
+            $statusCode   = 404
+            $responseText = '{"ok":false,"error":"not found"}'
+        }
+
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseText)
+        $res.StatusCode      = $statusCode
+        $res.ContentType     = 'application/json'
+        $res.ContentLength64 = $bytes.Length
+        $res.OutputStream.Write($bytes, 0, $bytes.Length)
+    } catch { }
+    try { $res.OutputStream.Close() } catch { }
+}
+
+# Non-blocking poll — call each watcher tick. Uses BeginGetContext/IsCompleted pattern.
+function Test-HttpApiRequests {
+    $l = $script:httpListener
+    if (-not $l -or -not $l.IsListening) { return }
+
+    # If no pending async receive, start one
+    if (-not $script:httpAsyncResult) {
+        try { $script:httpAsyncResult = $l.BeginGetContext($null, $null) } catch { return }
+    }
+
+    # Process all completed requests without blocking
+    while ($script:httpAsyncResult -and $script:httpAsyncResult.IsCompleted) {
+        $ar = $script:httpAsyncResult
+        $script:httpAsyncResult = $null
+        try {
+            $ctx = $l.EndGetContext($ar)
+            _Http-HandleContext -ctx $ctx
+        } catch { }
+        # Queue next receive
+        try { $script:httpAsyncResult = $l.BeginGetContext($null, $null) } catch { return }
+    }
+}
+
+# Shared cleanup launcher — used by file-signal fallback.
+function Invoke-CleanupFromPayload {
+    param($Payload)
+    $cleanScript = Join-Path $script:HereDir 'Clean-Junk.ps1'
+    if (-not (Test-Path $cleanScript)) { Write-Warning "Clean-Junk.ps1 not found"; return }
+
+    # Always run elevated — ensures full access to all system and user folders.
+    $argStr = "-NoProfile -ExecutionPolicy Bypass -File `"$cleanScript`""
+    if ($Payload -and $Payload.cats -and $Payload.cats.Count -gt 0) {
+        $argStr += " -CategoriesStr `"$($Payload.cats -join ',')`""
+    }
+    if ($Payload -and $Payload.browsers) { $argStr += ' -CloseBrowsers' }
+
+    Write-Host ""
+    Write-Host "[!] Cleanup triggered (elevated)" -ForegroundColor Yellow
+
+    try {
+        $psi             = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName    = 'powershell.exe'
+        $psi.Arguments   = $argStr
+        $psi.Verb        = 'RunAs'
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        Write-Host "[OK] Elevated cleanup started" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] UAC denied — running without elevation" -ForegroundColor Yellow
+        Start-Process powershell.exe -ArgumentList $argStr -WindowStyle Normal
+    }
+    $script:bgCache['forceJunk'] = $true
+    $script:lastJunkCheck = [DateTime]::MinValue
+}
+
+# ----------------------------------------------------------------------------
 # Проверка signal-файла от UI: если HTML-кнопка "Очистить мусор" сбросила
 # в Downloads файл — он забирается, удаляется и запускается Clean-Junk.ps1.
 # ----------------------------------------------------------------------------
-function Test-CleanupSignal {
+function Test-ScanSignal {
     $signalPaths = @(
-        (Join-Path $env:USERPROFILE 'Downloads\cybfortress_cleanup.signal'),
-        (Join-Path $script:HereDir 'cybfortress_cleanup.signal')
+        (Join-Path $env:USERPROFILE 'Downloads\cybfortress_scan.signal'),
+        (Join-Path $script:HereDir 'cybfortress_scan.signal')
     )
     foreach ($p in $signalPaths) {
         if (Test-Path $p) {
             try { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } catch { }
-            $cleanScript = Join-Path $script:HereDir 'Clean-Junk.ps1'
-            if (Test-Path $cleanScript) {
-                Write-Host ""
-                Write-Host "[!] Cleanup signal received — launching elevated cleaner..." -ForegroundColor Yellow
-                Write-Host "    UAC prompt will appear. Click YES to allow." -ForegroundColor Cyan
-                try {
-                    $psi = New-Object System.Diagnostics.ProcessStartInfo
-                    $psi.FileName  = 'powershell.exe'
-                    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$cleanScript`""
-                    $psi.Verb      = 'RunAs'
-                    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
-                    $proc = [System.Diagnostics.Process]::Start($psi)
-                    $proc.WaitForExit()
-                    Write-Host "[OK] Cleanup finished (exit code: $($proc.ExitCode))" -ForegroundColor Green
-                } catch {
-                    # UAC declined or error — fall back to same-process run
-                    Write-Host "[!] Elevation denied or failed, running without admin..." -ForegroundColor Yellow
-                    & $cleanScript
-                }
-                # форсируем пересбор junk-данных
-                $script:lastJunkCheck = [DateTime]::MinValue
-            } else {
-                Write-Warning "Clean-Junk.ps1 not found next to Get-SystemInfo.ps1"
-            }
+            Write-Host "[i] Scan signal received — forcing fresh junk scan..." -ForegroundColor Cyan
+            $script:bgCache['forceJunk'] = $true
+            $script:lastJunkCheck = [DateTime]::MinValue
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-CleanupSignal {
+    # File-based fallback (kept for compatibility; HTTP API is the primary path now)
+    $signalPaths = @(
+        (Join-Path $env:USERPROFILE 'Downloads\cybfortress_cleanup.signal'),
+        (Join-Path $script:HereDir  'cybfortress_cleanup.signal')
+    )
+    foreach ($p in $signalPaths) {
+        if (Test-Path $p) {
+            $sigJson = $null
+            try {
+                $raw = Get-Content -Raw -LiteralPath $p -ErrorAction SilentlyContinue
+                if ($raw) { $sigJson = $raw | ConvertFrom-Json }
+            } catch { }
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue } catch { }
+            Write-Host "[FILE-SIGNAL] Cleanup signal received" -ForegroundColor Yellow
+            Invoke-CleanupFromPayload -Payload $sigJson
             return $true
         }
     }
@@ -1458,6 +1705,328 @@ function Write-Snapshot {
     $json = $Snapshot | ConvertTo-Json -Depth 10 -Compress:$false
     $js = "// Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') by Get-SystemInfo.ps1`r`nwindow.SYSTEM_DATA = $json;"
     Set-Content -Path $Path -Value $js -Encoding UTF8
+}
+
+# =============================================================================
+# ФОНОВЫЙ WORKER — запускает тяжёлые сканы в отдельном Runspace,
+# чтобы основной цикл никогда не блокировался.
+# =============================================================================
+function Start-BackgroundWorker {
+    param([pscustomobject]$Cfg)
+
+    $token = ''
+    if ($Cfg.PSObject.Properties['github_token']) { $token = [string]$Cfg.github_token }
+    $script:bgCache['githubToken'] = $token
+    $script:bgCache['rootDir']     = $script:RootDir
+
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.ApartmentState = [System.Threading.ApartmentState]::MTA
+    $rs.ThreadOptions  = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('bgCache', $script:bgCache)
+
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+
+    $bgScript = {
+        $ErrorActionPreference = 'Continue'
+        $ProgressPreference    = 'SilentlyContinue'
+
+        # ------------------------------------------------------------------
+        # Вспомогательные функции (копии из основного скрипта)
+        # ------------------------------------------------------------------
+        function Get-FolderSize {
+            param([string]$Path, [int]$TimeoutSec = 8)
+            if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return [int64]0 }
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            try {
+                $sum = [int64]0
+                $files = [System.IO.Directory]::EnumerateFiles($Path, '*', [System.IO.SearchOption]::AllDirectories)
+                foreach ($f in $files) {
+                    if ($sw.Elapsed.TotalSeconds -gt $TimeoutSec) { break }
+                    try { $sum += [System.IO.FileInfo]::new($f).Length } catch { }
+                }
+                return [int64]$sum
+            } catch { return [int64]0 }
+            finally { $sw.Stop() }
+        }
+
+        function Get-RecycleBinSize {
+            $total = [int64]0
+            try {
+                $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+                $drives = [System.IO.DriveInfo]::GetDrives() |
+                    Where-Object { $_.IsReady -and $_.DriveType -eq [System.IO.DriveType]::Fixed }
+                foreach ($drv in $drives) {
+                    $binPath = Join-Path $drv.RootDirectory.FullName "`$Recycle.Bin\$sid"
+                    if (Test-Path -LiteralPath $binPath) { $total += Get-FolderSize $binPath }
+                }
+            } catch { }
+            return $total
+        }
+
+        # ------------------------------------------------------------------
+        # Сбор данных о мусоре (без кэширования — им управляет loop)
+        # ------------------------------------------------------------------
+        function Collect-JunkData {
+            param([string]$RootDir)
+
+            function Measure-Paths {
+                param([string[]]$Paths)
+                $sz = [int64]0
+                foreach ($p in $Paths) {
+                    try { if (Test-Path -LiteralPath $p) { $sz += Get-FolderSize $p } } catch { }
+                }
+                return $sz
+            }
+
+            $cats = @()
+
+            $tempPaths = @($env:TEMP)
+            $la = "$env:LOCALAPPDATA\Temp"
+            if ($la -ne $env:TEMP) { $tempPaths += $la }
+            $cats += @{ id='user_temp'; name='User Temp'; icon='T'; path=$env:TEMP; size_bytes=(Measure-Paths $tempPaths) }
+            $cats += @{ id='windows_temp'; name='Windows Temp'; icon='W'; path="$env:WINDIR\Temp"; size_bytes=(Measure-Paths @("$env:WINDIR\Temp")) }
+            $cats += @{ id='error_reports'; name='Error Reports'; icon='!'; path='WER + CrashDumps'
+                        size_bytes=(Measure-Paths @("$env:LOCALAPPDATA\Microsoft\Windows\WER","$env:LOCALAPPDATA\CrashDumps","$env:ProgramData\Microsoft\Windows\WER\ReportQueue")) }
+
+            $bpaths = [System.Collections.Generic.List[string]]::new()
+            $bpaths.Add("$env:LOCALAPPDATA\Microsoft\Windows\INetCache")
+            foreach ($sub in @('Default\Cache','Default\Code Cache','Default\GPUCache')) {
+                $bpaths.Add("$env:LOCALAPPDATA\Google\Chrome\User Data\$sub")
+                $bpaths.Add("$env:LOCALAPPDATA\Microsoft\Edge\User Data\$sub")
+            }
+            $ffBase = "$env:APPDATA\Mozilla\Firefox\Profiles"
+            if (Test-Path $ffBase) {
+                Get-ChildItem $ffBase -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                    $c = Join-Path $_.FullName 'cache2'; if (Test-Path $c) { $bpaths.Add($c) }
+                }
+            }
+            $cats += @{ id='browser_cache'; name='Browser Cache'; icon='B'; path='Chrome/Edge/Firefox'; size_bytes=(Measure-Paths $bpaths.ToArray()) }
+            $cats += @{ id='gpu_cache'; name='GPU Cache'; icon='G'; path='D3DS/NVIDIA/AMD/Intel'
+                        size_bytes=(Measure-Paths @("$env:LOCALAPPDATA\D3DSCache","$env:LOCALAPPDATA\NVIDIA\DXCache","$env:LOCALAPPDATA\NVIDIA\GLCache","$env:LOCALAPPDATA\AMD\DxCache","$env:LOCALAPPDATA\AMD\GLCache","$env:LOCALAPPDATA\Intel\ShaderCache")) }
+
+            $thumbSz = [int64]0
+            $thumbDir = "$env:LOCALAPPDATA\Microsoft\Windows\Explorer"
+            if (Test-Path $thumbDir) { Get-ChildItem $thumbDir -Filter '*.db' -Force -ErrorAction SilentlyContinue | ForEach-Object { $thumbSz += $_.Length } }
+            $cats += @{ id='thumbnails'; name='Thumbnails'; icon='I'; path=$thumbDir; size_bytes=$thumbSz }
+
+            $apaths = [System.Collections.Generic.List[string]]::new()
+            foreach ($sub in @('Cache','blob_storage','databases','gpucache','logs')) { $apaths.Add("$env:LOCALAPPDATA\Microsoft\Teams\$sub") }
+            foreach ($sub in @('Cache','Code Cache','GPUCache')) { $apaths.Add("$env:APPDATA\discord\$sub") }
+            $apaths.Add("$env:LOCALAPPDATA\Spotify\Storage"); $apaths.Add("$env:LOCALAPPDATA\Spotify\Data")
+            foreach ($sub in @('Cache','Code Cache','GPUCache','logs')) { $apaths.Add("$env:APPDATA\Code\$sub") }
+            $tdataPath = "$env:APPDATA\Telegram Desktop\tdata"
+            if (Test-Path $tdataPath) {
+                Get-ChildItem -LiteralPath $tdataPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                    foreach ($cs in @('cache','media_cache','cache2')) { $cp = Join-Path $_.FullName $cs; if (Test-Path $cp) { $apaths.Add($cp) } }
+                }
+            }
+            Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Office" -Directory -ErrorAction SilentlyContinue |
+                ForEach-Object { $p = Join-Path $_.FullName 'OfficeFileCache'; if (Test-Path $p) { $apaths.Add($p) } }
+            $cats += @{ id='app_cache'; name='App Cache'; icon='A'; path='Teams/Discord/Spotify/VSCode/Telegram'; size_bytes=(Measure-Paths $apaths.ToArray()) }
+
+            $steamInstall = ''
+            try { $steamInstall = (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue).SteamPath } catch { }
+            if (-not $steamInstall) { $steamInstall = 'C:\Program Files (x86)\Steam' }
+            $steamSz = Measure-Paths @("$env:LOCALAPPDATA\Steam\htmlcache","$env:LOCALAPPDATA\Steam\logs","$steamInstall\logs","$steamInstall\dumps","$steamInstall\shadercache")
+            if ($steamSz -gt 0) { $cats += @{ id='steam_cache'; name='Steam Cache'; icon='S'; path='Steam logs/htmlcache/shadercache'; size_bytes=$steamSz } }
+
+            $bhpaths = [System.Collections.Generic.List[string]]::new()
+            $histFiles = @('History','Visited Links','Top Sites','Favicons','Media History','Session Storage')
+            foreach ($base in @("$env:LOCALAPPDATA\Google\Chrome\User Data","$env:LOCALAPPDATA\Microsoft\Edge\User Data","$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data")) {
+                if (-not (Test-Path $base)) { continue }
+                $profs = @("$base\Default") + @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^Profile \d+$' } | ForEach-Object { $_.FullName })
+                foreach ($prof in $profs) { foreach ($hf in $histFiles) { $fp = Join-Path $prof $hf; if (Test-Path $fp) { $bhpaths.Add($fp) } } }
+            }
+            $bhSz = [int64]0; foreach ($fp in $bhpaths) { try { $bhSz += [System.IO.FileInfo]::new($fp).Length } catch { } }
+            if ($bhSz -gt 0) { $cats += @{ id='browser_history'; name='Browser History'; icon='H'; path='Chrome/Edge/Brave history files'; size_bytes=$bhSz } }
+
+            $cats += @{ id='dev_cache'; name='Dev Tools Cache'; icon='D'; path='npm/pip/NuGet/Yarn'
+                        size_bytes=(Measure-Paths @("$env:LOCALAPPDATA\npm-cache","$env:APPDATA\npm-cache","$env:LOCALAPPDATA\pip\Cache","$env:LOCALAPPDATA\NuGet\Cache","$env:LOCALAPPDATA\NuGet\v3-cache","$env:LOCALAPPDATA\Yarn\Cache")) }
+
+            $extPaths = [System.Collections.Generic.List[string]]::new()
+            foreach ($ep in @("$env:APPDATA\Microsoft\Windows\Recent","$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations","$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations","$env:USERPROFILE\AppData\LocalLow\Sun\Java\Deployment\cache","$env:APPDATA\Microsoft\Windows Media Player","$env:TEMP\chocolatey")) { $extPaths.Add($ep) }
+            if (Test-Path "$env:LOCALAPPDATA\Packages") {
+                Get-ChildItem -LiteralPath "$env:LOCALAPPDATA\Packages" -Directory -ErrorAction SilentlyContinue | ForEach-Object { $p = Join-Path $_.FullName 'AC\Temp'; if (Test-Path $p) { $extPaths.Add($p) } }
+            }
+            $cats += @{ id='extended'; name='Extended Areas'; icon='X'; path='Recent/JumpLists/Java/StoreTemp'; size_bytes=(Measure-Paths $extPaths.ToArray()) }
+            $cats += @{ id='prefetch'; name='Prefetch'; icon='P'; path="$env:WINDIR\Prefetch"; size_bytes=(Measure-Paths @("$env:WINDIR\Prefetch")) }
+            $cats += @{ id='system_junk'; name='System Junk'; icon='S'; path='CBS/PatchCache/Minidump/Font'
+                        size_bytes=(Measure-Paths @("$env:WINDIR\Logs\CBS","$env:WINDIR\Installer\`$PatchCache`$","$env:WINDIR\Minidump","$env:WINDIR\ServiceProfiles\LocalService\AppData\Local\FontCache","$env:WINDIR\memory.dmp")) }
+            $cats += @{ id='windows_update'; name='Windows Update'; icon='U'; path='SoftwareDistribution'
+                        size_bytes=(Measure-Paths @("$env:WINDIR\SoftwareDistribution\Download","$env:WINDIR\Logs\WindowsUpdate")) }
+            $cats += @{ id='system_logs'; name='System Logs'; icon='L'; path='System32\LogFiles'
+                        size_bytes=(Measure-Paths @("$env:WINDIR\System32\LogFiles","$env:WINDIR\debug")) }
+
+            $evtSz = [int64]0
+            try { Get-WinEvent -ListLog Application,System,Security,Setup -ErrorAction SilentlyContinue | ForEach-Object { try { $evtSz += [int64]$_.FileSize } catch { } } } catch { }
+            $cats += @{ id='event_logs'; name='Event Logs'; icon='E'; path='Windows Event Logs'; size_bytes=$evtSz }
+
+            try {
+                $vssItems = @(Get-WmiObject Win32_ShadowCopy -ErrorAction SilentlyContinue)
+                if ($vssItems.Count -gt 1) {
+                    $sviSz = [int64]0; try { $sviSz = Get-FolderSize "$env:SystemDrive\System Volume Information" } catch { }
+                    $cats += @{ id='vss'; name="VSS Shadows ($($vssItems.Count) copies)"; icon='V'; path='System Volume Information'; size_bytes=$sviSz }
+                }
+            } catch { }
+
+            $winOldSz = Get-FolderSize 'C:\Windows.old'
+            if ($winOldSz -gt 0) { $cats += @{ id='windows_old'; name='Windows.old'; icon='X'; path='C:\Windows.old'; size_bytes=$winOldSz } }
+            $cats += @{ id='recycle_bin'; name='Recycle Bin'; icon='R'; path='$Recycle.Bin'; size_bytes=(Get-RecycleBinSize) }
+
+            $emptyCount = 0
+            $emptyRoots = @($env:TEMP,"$env:LOCALAPPDATA\Temp","$env:USERPROFILE\Documents","$env:USERPROFILE\Downloads","$env:USERPROFILE\Desktop","$env:USERPROFILE\Pictures","$env:USERPROFILE\Videos")
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            foreach ($root in $emptyRoots) {
+                if (-not (Test-Path $root)) { continue }
+                try {
+                    Get-ChildItem -LiteralPath $root -Recurse -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                        if ($sw.Elapsed.TotalSeconds -gt 6) { return }
+                        try { if (-not [bool]([System.IO.Directory]::EnumerateFileSystemEntries($_.FullName) | Select-Object -First 1)) { $emptyCount++ } } catch { }
+                    }
+                } catch { }
+                if ($sw.Elapsed.TotalSeconds -gt 6) { break }
+            }
+            $sw.Stop()
+            if ($emptyCount -gt 0) { $cats += @{ id='empty_folders'; name="Empty Folders ($emptyCount)"; icon='∅'; path='Documents/Downloads/Desktop/Temp'; size_bytes=[int64]0 } }
+
+            $total = [int64]0; foreach ($c in $cats) { try { $total += [int64]($c.size_bytes) } catch { } }
+            $totalCount = ($cats | Where-Object { $_.size_bytes -gt 0 }).Count
+
+            $lastCleanLog = $null
+            $logFile = Join-Path $RootDir 'data\last-cleanup.json'
+            if (Test-Path $logFile) { try { $lastCleanLog = Get-Content -Raw -Path $logFile | ConvertFrom-Json } catch { } }
+
+            return @{
+                scanned_at       = [DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')
+                total_bytes      = $total
+                total_categories = $totalCount
+                categories       = ,$cats
+                last_cleanup     = $lastCleanLog
+            }
+        }
+
+        # ------------------------------------------------------------------
+        # GitHub releases (параллельные HTTP запросы, таймаут 7 сек)
+        # ------------------------------------------------------------------
+        function Collect-ReleasesData {
+            param([string]$Token)
+            $repos = @('MHSanaei/3x-ui','XTLS/Xray-core','amnezia-vpn/amneziawg-go','apernet/hysteria')
+            $client = [System.Net.Http.HttpClient]::new()
+            $client.Timeout = [System.TimeSpan]::FromSeconds(7)
+            $client.DefaultRequestHeaders.TryAddWithoutValidation('User-Agent', 'CYBERFORTRESS-dashboard') | Out-Null
+            $client.DefaultRequestHeaders.TryAddWithoutValidation('Accept', 'application/vnd.github+json') | Out-Null
+            if ($Token) { $client.DefaultRequestHeaders.TryAddWithoutValidation('Authorization', "Bearer $Token") | Out-Null }
+            $taskArr = [System.Threading.Tasks.Task[]]($repos | ForEach-Object {
+                $client.GetStringAsync("https://api.github.com/repos/$_/releases?per_page=5")
+            })
+            try { [System.Threading.Tasks.Task]::WaitAll($taskArr, 8000) } catch { }
+            $items = for ($i = 0; $i -lt $repos.Count; $i++) {
+                if ($taskArr[$i].Status -eq 'RanToCompletion') {
+                    try {
+                        $resp   = $taskArr[$i].Result | ConvertFrom-Json
+                        $stable = $resp | Where-Object { -not $_.prerelease -and -not $_.draft } | Select-Object -First 1
+                        $pre    = $resp | Where-Object {     $_.prerelease -and -not $_.draft } | Select-Object -First 1
+                        @{ repo=$repos[$i]
+                           stable     = if ($stable) { @{ tag=$stable.tag_name; name=$stable.name; published=$stable.published_at; url=$stable.html_url } } else { $null }
+                           prerelease = if ($pre)    { @{ tag=$pre.tag_name;    name=$pre.name;    published=$pre.published_at;    url=$pre.html_url    } } else { $null }
+                           error=$null }
+                    } catch { @{ repo=$repos[$i]; stable=$null; prerelease=$null; error=$_.Exception.Message } }
+                } else {
+                    $errMsg = if ($taskArr[$i].Exception) { $taskArr[$i].Exception.GetBaseException().Message } else { 'timeout' }
+                    @{ repo=$repos[$i]; stable=$null; prerelease=$null; error=$errMsg }
+                }
+            }
+            $client.Dispose()
+            return @{ scanned_at=[DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'); items=,$items }
+        }
+
+        # ------------------------------------------------------------------
+        # Windows Updates (COM, нужен MTA — работает в большинстве систем)
+        # ------------------------------------------------------------------
+        function Collect-UpdatesData {
+            $result = @{ scanned_at=[DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'); available=0; critical=0; items=,@(); error=$null }
+            try {
+                $session  = New-Object -ComObject Microsoft.Update.Session
+                $searcher = $session.CreateUpdateSearcher()
+                $sr = $searcher.Search('IsInstalled=0 and IsHidden=0')
+                $items = @(); $crit = 0
+                foreach ($u in $sr.Updates) {
+                    $isCrit = $false
+                    try { foreach ($cat in $u.Categories) { if ($cat.Name -match 'Critical|Security') { $isCrit = $true; break } } } catch { }
+                    if ($isCrit) { $crit++ }
+                    $items += @{ title=$u.Title; size_mb=if ($u.MaxDownloadSize) { [math]::Round([int64]$u.MaxDownloadSize/1MB,1) } else { 0 }; critical=$isCrit }
+                    if ($items.Count -ge 15) { break }
+                }
+                $result.available = $sr.Updates.Count; $result.critical = $crit; $result.items = ,$items
+                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($session) | Out-Null
+            } catch { $result.error = $_.Exception.Message }
+            return $result
+        }
+
+        # ------------------------------------------------------------------
+        # Системные ошибки (Event Log, кэш 300 сек)
+        # ------------------------------------------------------------------
+        function Collect-ErrorsData {
+            $errors = @()
+            try {
+                $cutoff = [DateTime]::Now.AddDays(-2)
+                $events = Get-WinEvent -FilterHashtable @{ LogName='System','Application'; Level=1,2; StartTime=$cutoff } -MaxEvents 25 -ErrorAction SilentlyContinue
+                foreach ($e in $events) {
+                    $msg = $e.Message; if ($msg.Length -gt 240) { $msg = $msg.Substring(0,240) + '...' }
+                    $errors += @{ time=$e.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); source=$e.ProviderName; log=$e.LogName; level=if ($e.Level -eq 1) { 'CRITICAL' } else { 'ERROR' }; event_id=$e.Id; message=$msg }
+                }
+            } catch { }
+            return @{ scanned_at=[DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'); count=$errors.Count; items=,$errors }
+        }
+
+        # ------------------------------------------------------------------
+        # Основной фоновый цикл
+        # ------------------------------------------------------------------
+        $junkCheckedAt = [DateTime]::MinValue
+        $relCheckedAt  = [DateTime]::MinValue
+        $updCheckedAt  = [DateTime]::MinValue
+        $errCheckedAt  = [DateTime]::MinValue
+
+        while ($true) {
+            $now = [DateTime]::Now
+
+            # Системные ошибки (быстро, ~1s, каждые 5 мин)
+            if (($now - $errCheckedAt).TotalSeconds -ge 300) {
+                try { $bgCache['sysErrors'] = Collect-ErrorsData } catch { }
+                $errCheckedAt = [DateTime]::Now
+            }
+
+            # GitHub releases (параллельные HTTP, ~7-8s, каждые 30 мин)
+            if (($now - $relCheckedAt).TotalSeconds -ge 1800) {
+                try { $bgCache['releases'] = Collect-ReleasesData -Token $bgCache['githubToken'] } catch { }
+                $relCheckedAt = [DateTime]::Now
+            }
+
+            # Junk scan (~20-30s, каждые 2 мин или по запросу)
+            if ($bgCache['forceJunk'] -or ($now - $junkCheckedAt).TotalSeconds -ge 120) {
+                $bgCache['forceJunk'] = $false
+                try { $bgCache['junk'] = Collect-JunkData -RootDir $bgCache['rootDir'] } catch { }
+                $junkCheckedAt = [DateTime]::Now
+            }
+
+            # Windows Updates (COM, ~5-10s, каждые 30 мин — запускаем последним)
+            if (($now - $updCheckedAt).TotalSeconds -ge 1800) {
+                try { $bgCache['updates'] = Collect-UpdatesData } catch { }
+                $updCheckedAt = [DateTime]::Now
+            }
+
+            Start-Sleep -Seconds 5
+        }
+    }
+
+    $ps.AddScript($bgScript) | Out-Null
+    $ps.BeginInvoke() | Out-Null
+
+    $script:bgRunspace   = $rs
+    $script:bgPowerShell = $ps
+    Write-Host "[BG] Background worker started — junk/releases/updates/errors run async" -ForegroundColor Cyan
 }
 
 # =============================================================================
@@ -1475,14 +2044,16 @@ Write-Host ""
 if ($Watch) {
     Write-Host "Режим: WATCH (интервал $Interval сек). Ctrl+C — остановка." -ForegroundColor Yellow
     Write-Host ""
-    $script:firstSnapshotDone = $false
+    Start-HttpApi
+    # Запускаем фоновый Runspace — тяжёлые операции больше не блокируют основной цикл
+    Start-BackgroundWorker -Cfg $cfg
     while ($true) {
-        # Проверка signal-файла от кнопки "Очистить мусор"
-        Test-CleanupSignal | Out-Null
+        Test-HttpApiRequests | Out-Null
+        Test-ScanSignal      | Out-Null
+        Test-CleanupSignal   | Out-Null
 
         $snap = Build-DataSnapshot -Cfg $cfg
         Write-Snapshot -Snapshot $snap -Path $OutputPath
-        $script:firstSnapshotDone = $true
         Write-Host "[OK] $(Get-Date -Format 'HH:mm:ss') -> $OutputPath" -ForegroundColor Green
         Start-Sleep -Seconds $Interval
     }
