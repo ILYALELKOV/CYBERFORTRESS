@@ -113,7 +113,11 @@
     const sysDrive = D.disk?.logical?.find(d => d.drive === 'C:') || (D.disk?.logical && D.disk.logical[0]);
     H.disk.push(sysDrive?.used_percent ?? 0);
 
-    const primaryIf = (D.network?.interfaces || []).find(i => i.ip4 && i.ip4 !== '172.18.0.1' && !i.ip4.startsWith('169.')) || (D.network?.interfaces || [])[0];
+    const BAD_IFACE = /docker|wsl|hyper-v|virtual|loopback|tap|vpn|tunnel|vethernet/i;
+    const isRealIp  = ip => ip && !ip.startsWith('127.') && !ip.startsWith('169.254.') && !/^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+    const primaryIf = (D.network?.interfaces || []).find(i => isRealIp(i.ip4) && !BAD_IFACE.test(i.description || ''))
+                   || (D.network?.interfaces || []).find(i => isRealIp(i.ip4))
+                   || (D.network?.interfaces || [])[0];
     H.rx.push(primaryIf?.rx_bytes ?? 0);
     H.tx.push(primaryIf?.tx_bytes ?? 0);
     H.ping.push(D.router?.ping_ms ?? 0);
@@ -438,12 +442,19 @@
   /* ============================================================ */
   /* MAIN RENDER                                                   */
   /* ============================================================ */
+  let _lastRenderedIso = null;   // последний отрисованный generated_iso
+
   function render(D) {
     if (!D) {
       $('bootscreen').style.display = 'grid';
       return;
     }
     $('bootscreen').style.display = 'none';
+
+    // Пропускаем полный рендер если данные не изменились (backend ещё не обновил снепшот)
+    const iso = D.meta?.generated_iso;
+    if (iso && iso === _lastRenderedIso) return;
+    _lastRenderedIso = iso;
 
     pushSample(D);
     $('sampleCount').textContent = H.cpu.length;
@@ -1373,23 +1384,17 @@
     $('junkMeta').textContent = 'Идёт сбор данных, ~5-15 сек...';
 
     _scanTick = setInterval(() => {
-      const curTs = window.SYSTEM_DATA?.junk?.scanned_at;
-      if (curTs && curTs !== _scanPrevTs) {
-        clearInterval(_scanTick); _scanTick = null;
-        _isScanning = false;
-        _hasScanned = true;
-        if (btn)  { btn.disabled = false; btn.classList.remove('scanning'); }
-        if (span) span.textContent = 'СКАНИРОВАТЬ';
-        const hasSelection = _selectedCats.size > 0;
-        $('btnClean').disabled = !hasSelection;
-        return;
-      }
-      if ((Date.now() - _scanStart) > 90000) {
-        clearInterval(_scanTick); _scanTick = null;
-        _isScanning = false;
-        if (btn)  { btn.disabled = false; btn.classList.remove('scanning'); }
-        if (span) span.textContent = 'СКАНИРОВАТЬ';
-      }
+      const curTs   = window.SYSTEM_DATA?.junk?.scanned_at;
+      const elapsed = Date.now() - _scanStart;
+      const done    = (curTs && curTs !== _scanPrevTs) || elapsed > 45000;
+      if (!done) return;
+
+      clearInterval(_scanTick); _scanTick = null;
+      _isScanning = false;
+      _hasScanned = curTs && curTs !== _scanPrevTs;   // false — если истёк таймаут
+      if (btn)  { btn.disabled = false; btn.classList.remove('scanning'); }
+      if (span) span.textContent = 'СКАНИРОВАТЬ';
+      $('btnClean').disabled = _selectedCats.size === 0;
     }, 1000);
   }
 
@@ -1492,7 +1497,6 @@
     // Честные фазовые метки — не врём о процентах
     if      (elapsed <  5)  _cpSetLabel('ОЖИДАНИЕ UAC...');
     else if (elapsed < 20)  _cpSetLabel(_cleanHasBrowser ? 'ЗАКРЫТИЕ БРАУЗЕРОВ...' : 'ЗАПУСК ОЧИСТКИ...');
-    else if (elapsed < 40)  _cpSetLabel('ОЧИСТКА ФАЙЛОВ...');
     else if (elapsed < 100) _cpSetLabel('ОЧИСТКА ФАЙЛОВ...');
     else if (elapsed < 250) _cpSetLabel('ГЛУБОКАЯ ОЧИСТКА...');
     else                    _cpSetLabel('ФИНАЛИЗАЦИЯ...');
@@ -1668,23 +1672,66 @@
   /* ============================================================ */
   /* LIVE DATA RELOAD (no page refresh)                            */
   /* ============================================================ */
-  const RELOAD_INTERVAL_MS = 3000;
+  const RELOAD_INTERVAL_MS = 2000;
+  const API_DATA_URL       = 'http://localhost:7779/api/data';
+  const API_FETCH_TIMEOUT  = 2500;   // мс, должен быть < RELOAD_INTERVAL_MS
   $('reloadInterval').textContent = (RELOAD_INTERVAL_MS / 1000) + 's';
 
-  function reloadData() {
+  // Первичный транспорт: HTTP GET /api/data — JSON из памяти, без дисковой I/O.
+  // Fallback: динамическая инъекция <script> файла system-data.js.
+  let _useHttp = true;   // переключается автоматически при ошибке
+  let _httpFailCount = 0;
+
+  async function reloadDataHttp() {
+    const ctrl = new AbortController();
+    const tid = setTimeout(() => ctrl.abort(), API_FETCH_TIMEOUT);
+    try {
+      const r = await fetch(API_DATA_URL, { signal: ctrl.signal, cache: 'no-store' });
+      clearTimeout(tid);
+      if (!r.ok) return null;
+      const data = await r.json();
+      window.SYSTEM_DATA = data;
+      _httpFailCount = 0;
+      return data;
+    } catch {
+      clearTimeout(tid);
+      _httpFailCount++;
+      if (_httpFailCount >= 3) _useHttp = false;  // откатываемся на файл
+      return null;
+    }
+  }
+
+  function reloadDataFile() {
     return new Promise((resolve) => {
       const old = document.getElementById('telemetry-script');
       if (old) old.remove();
       const s = document.createElement('script');
       s.id = 'telemetry-script';
       s.src = `../data/system-data.js?_=${Date.now()}`;
-      s.onload = () => resolve(window.SYSTEM_DATA);
+      s.onload = () => {
+        _httpFailCount = 0;
+        resolve(window.SYSTEM_DATA);
+      };
       s.onerror = () => resolve(null);
       document.body.appendChild(s);
     });
   }
 
+  async function reloadData() {
+    if (_useHttp) {
+      const d = await reloadDataHttp();
+      if (d) return d;
+      // HTTP недоступен — пробуем файл разово, потом снова HTTP
+    }
+    const d = await reloadDataFile();
+    if (d && !_useHttp && _httpFailCount === 0) _useHttp = true;  // HTTP снова работает
+    return d;
+  }
+
   function startLiveReload() {
+    // Первый запрос — немедленно, без ожидания интервала
+    reloadData().then(D => { if (D) { $('bootscreen').style.display = 'none'; render(D); } });
+
     setInterval(async () => {
       const D = await reloadData();
       if (D) {

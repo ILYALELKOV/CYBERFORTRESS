@@ -66,8 +66,24 @@ $script:bgCache['sysErrors']   = @{ status='scanning'; scanned_at=''; count=0; i
 $script:bgCache['forceJunk']   = $false
 $script:bgCache['githubToken'] = ''
 $script:bgCache['rootDir']     = ''
-$script:bgRunspace   = $null
-$script:bgPowerShell = $null
+
+# Последний собранный снепшот в виде JSON-строки (для /api/data)
+$script:currentSnapshotJson = ''
+# Кэш медленных WMI/SSH вызовов: @{ key = @{data=...; expiresAt=[DateTime]} }
+$script:slowCache = @{}
+# Когда последний раз писали файл system-data.js
+$script:lastFileWrite = [DateTime]::MinValue
+$script:bgRunspace    = $null
+$script:bgPowerShell  = $null
+$script:firstSnapshot = $true   # пропускаем роутер/синолоджи на первом вызове
+# Shared state between main loop and dedicated HTTP server runspace
+$script:httpShared = [System.Collections.Hashtable]::Synchronized(@{
+    json           = ''
+    cleanupPending = $false
+    cleanupPayload = $null
+})
+$script:httpRunspace   = $null
+$script:httpPowerShell = $null
 
 # ----------------------------------------------------------------------------
 # Загрузка .env (KEY=VALUE построчно, # — комментарий)
@@ -265,7 +281,6 @@ function Get-MemoryInfo {
         $usedKB  = $totalKB - $freeKB
 
         $modules = @()
-        $bankIndex = 0
         foreach ($m in (Get-CimInstance Win32_PhysicalMemory)) {
             $modules += @{
                 slot         = $m.DeviceLocator
@@ -282,7 +297,6 @@ function Get-MemoryInfo {
                     24 {'DDR3'} 26 {'DDR4'} 34 {'DDR5'} default { "type-$($m.SMBIOSMemoryType)" }
                 }
             }
-            $bankIndex++
         }
 
         return @{
@@ -427,7 +441,7 @@ function Get-NetworkInfo {
                 name        = $if.Name
                 description = $if.InterfaceDescription
                 mac         = $if.MacAddress
-                speed_mbps  = [math]::Round($if.LinkSpeed.Replace(' Gbps','000').Replace(' Mbps','') -as [double], 0) # простое преобразование
+                speed_mbps  = try { if ($if.LinkSpeed -match '([\d.]+)\s*(G|M)bps') { $v=[double]$matches[1]; if ($matches[2]-eq'G'){[int]($v*1000)}else{[int]$v} } else { 0 } } catch { 0 }
                 ip4         = $ip4
                 ip6         = $ip6
                 status      = $if.Status
@@ -537,10 +551,11 @@ function Get-RouterInfo {
         $result.device_count = 0
     }
 
-    # DNS resolve test
+    # Internet connectivity — async TCP к 1.1.1.1:443 (timeout 2s, не виснет на firewall)
     try {
-        $dnsTest = Test-NetConnection -ComputerName 8.8.8.8 -Port 53 -InformationLevel Quiet -ErrorAction SilentlyContinue
-        $result.internet_dns_ok = [bool]$dnsTest
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        $result.internet_dns_ok = $tcp.ConnectAsync('1.1.1.1', 443).Wait(2000)
+        try { $tcp.Close() } catch { }
     } catch {
         $result.internet_dns_ok = $false
     }
@@ -1437,37 +1452,46 @@ echo "===END==="
 function Build-DataSnapshot {
     param([pscustomobject]$Cfg)
 
-    Write-Host "[+] Сбор данных ОС..." -ForegroundColor Cyan
-    $os  = Get-OSInfo
+    # Статичные данные (меняются редко) — берём из кэша.
+    # Get-CachedOrFetch перезапрашивает только когда TTL истёк.
+    $os  = Get-CachedOrFetch 'os'          60  { Get-OSInfo }
+    $mb  = Get-CachedOrFetch 'motherboard' 300 { Get-MotherboardInfo }
+    $disk= Get-CachedOrFetch 'disk'        30  { Get-DiskInfo }
 
-    Write-Host "[+] CPU..." -ForegroundColor Cyan
+    # Динамические данные — обновляем каждый цикл (CPU load, RAM, GPU util, Net bytes)
+    Write-Host "[+] CPU/RAM/GPU/Net..." -ForegroundColor Cyan
     $cpu = Get-CPUInfo
-
-    Write-Host "[+] RAM..." -ForegroundColor Cyan
     $mem = Get-MemoryInfo
-
-    Write-Host "[+] GPU..." -ForegroundColor Cyan
     $gpu = Get-GPUInfo
-
-    Write-Host "[+] Диски..." -ForegroundColor Cyan
-    $disk = Get-DiskInfo
-
-    Write-Host "[+] Материнская плата..." -ForegroundColor Cyan
-    $mb = Get-MotherboardInfo
-
-    Write-Host "[+] Сеть..." -ForegroundColor Cyan
     $net = Get-NetworkInfo
 
+    # Router и Synology: тяжёлые сетевые вызовы, кэшируем на 30 сек.
+    # На ПЕРВОМ снепшоте пропускаем — чтобы не блокировать старт на 5-30 сек.
+    # Реальные данные появятся со второго цикла (через 3 сек), кэш уже будет тёплый.
     $router = $null
     if ($Cfg.router.enabled) {
-        Write-Host "[+] Роутер..." -ForegroundColor Cyan
-        $router = Get-RouterInfo -Cfg $Cfg.router -AutoGateway $net.gateway
+        $rEntry = $script:slowCache['router']
+        if ($rEntry -and $rEntry.expiresAt -gt [DateTime]::Now) {
+            $router = $rEntry.data
+        } elseif ($script:firstSnapshot) {
+            $router = @{ status='loading'; reachable=$false }
+        } else {
+            $router = Get-RouterInfo -Cfg $Cfg.router -AutoGateway $net.gateway
+            $script:slowCache['router'] = @{ data=$router; expiresAt=[DateTime]::Now.AddSeconds(30) }
+        }
     }
 
     $synology = $null
     if ($Cfg.synology.enabled) {
-        Write-Host "[+] Synology NAS ($($Cfg.synology.host))..." -ForegroundColor Cyan
-        $synology = Get-SynologyInfo -Cfg $Cfg.synology
+        $sEntry = $script:slowCache['synology']
+        if ($sEntry -and $sEntry.expiresAt -gt [DateTime]::Now) {
+            $synology = $sEntry.data
+        } elseif ($script:firstSnapshot) {
+            $synology = @{ status='loading'; enabled=$true; reachable=$false }
+        } else {
+            $synology = Get-SynologyInfo -Cfg $Cfg.synology
+            $script:slowCache['synology'] = @{ data=$synology; expiresAt=[DateTime]::Now.AddSeconds(30) }
+        }
     }
 
     # Тяжёлые данные читаем из фонового кэша — никакой блокировки основного цикла.
@@ -1525,103 +1549,100 @@ function Build-DataSnapshot {
 }
 
 # ----------------------------------------------------------------------------
-# HTTP API (localhost:7779) — надёжная альтернатива file-download сигналам.
-# Фронтенд делает POST /api/scan или POST /api/cleanup (JSON body).
+# HTTP API (localhost:7779) — выделенный blocking-runspace, отвечает мгновенно
+# независимо от того, чем занят основной цикл. Читает json из httpShared,
+# пишет сигналы обратно через bgCache / httpShared.
 # ----------------------------------------------------------------------------
-$script:httpListener    = $null
-$script:apiPort         = 7779
-$script:httpAsyncResult = $null   # IAsyncResult from BeginGetContext
+function Start-HttpServer {
+    param([int]$Port = 7779)
 
-function Start-HttpApi {
-    try {
-        $l = [System.Net.HttpListener]::new()
-        $l.Prefixes.Add("http://localhost:$($script:apiPort)/")
-        $l.Start()
-        $script:httpListener = $l
-        # Kick off first async receive
-        $script:httpAsyncResult = $l.BeginGetContext($null, $null)
-        Write-Host "[HTTP] API listening on http://localhost:$($script:apiPort)/" -ForegroundColor Cyan
-    } catch {
-        Write-Host "[HTTP] Could not start API listener: $_" -ForegroundColor DarkGray
-    }
-}
+    $shared  = $script:httpShared
+    $bgCache = $script:bgCache
 
-function Stop-HttpApi {
-    if ($script:httpListener) {
-        try { $script:httpListener.Stop(); $script:httpListener.Close() } catch { }
-        $script:httpListener    = $null
-        $script:httpAsyncResult = $null
-    }
-}
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.ApartmentState = [System.Threading.ApartmentState]::MTA
+    $rs.ThreadOptions  = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('shared',  $shared)
+    $rs.SessionStateProxy.SetVariable('bgCache', $bgCache)
+    $rs.SessionStateProxy.SetVariable('port',    $Port)
 
-function _Http-HandleContext {
-    param($ctx)
-    $req = $ctx.Request
-    $res = $ctx.Response
-    try {
-        $res.AddHeader('Access-Control-Allow-Origin',  '*')
-        $res.AddHeader('Access-Control-Allow-Methods', 'POST,GET,OPTIONS')
-        $res.AddHeader('Access-Control-Allow-Headers', 'Content-Type')
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
 
-        $path   = $req.Url.AbsolutePath.ToLower()
-        $method = $req.HttpMethod.ToUpper()
-        $body   = $null
-        if ($req.HasEntityBody) {
+    $httpScript = {
+        $ErrorActionPreference = 'Continue'
+        $listener = [System.Net.HttpListener]::new()
+        $listener.Prefixes.Add("http://localhost:$port/")
+        try { $listener.Start() } catch { return }
+
+        while ($listener.IsListening) {
             try {
-                $reader = [System.IO.StreamReader]::new($req.InputStream)
-                $raw    = $reader.ReadToEnd()
-                $reader.Close()
-                if ($raw) { $body = $raw | ConvertFrom-Json }
-            } catch { }
+                $ctx = $listener.GetContext()   # blocking — zero CPU spin
+                $req = $ctx.Request
+                $res = $ctx.Response
+                try {
+                    $res.AddHeader('Access-Control-Allow-Origin',          '*')
+                    $res.AddHeader('Access-Control-Allow-Methods',         'POST,GET,OPTIONS')
+                    $res.AddHeader('Access-Control-Allow-Headers',         'Content-Type')
+                    $res.AddHeader('Access-Control-Allow-Private-Network', 'true')
+
+                    $path   = $req.Url.AbsolutePath.ToLower()
+                    $method = $req.HttpMethod.ToUpper()
+                    $body   = $null
+                    if ($req.HasEntityBody) {
+                        try {
+                            $reader = [System.IO.StreamReader]::new($req.InputStream)
+                            $raw    = $reader.ReadToEnd()
+                            $reader.Close()
+                            if ($raw) { $body = $raw | ConvertFrom-Json }
+                        } catch { }
+                    }
+
+                    $statusCode   = 200
+                    $responseText = '{"ok":true}'
+
+                    if ($method -eq 'OPTIONS') {
+                        # CORS preflight
+                    } elseif ($path -eq '/api/data' -and $method -eq 'GET') {
+                        $j = $shared['json']
+                        if ($j) {
+                            $responseText = $j
+                            $res.AddHeader('Cache-Control', 'no-cache, no-store')
+                        } else {
+                            $statusCode   = 503
+                            $responseText = '{"error":"not ready yet"}'
+                        }
+                    } elseif ($path -eq '/api/scan') {
+                        $bgCache['forceJunk'] = $true
+                    } elseif ($path -eq '/api/cleanup') {
+                        $shared['cleanupPayload'] = $body
+                        $shared['cleanupPending'] = $true
+                    } else {
+                        $statusCode   = 404
+                        $responseText = '{"ok":false,"error":"not found"}'
+                    }
+
+                    $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseText)
+                    $res.StatusCode      = $statusCode
+                    $res.ContentType     = 'application/json'
+                    $res.ContentLength64 = $bytes.Length
+                    $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                } catch { }
+                try { $res.OutputStream.Close() } catch { }
+            } catch {
+                if (-not $listener.IsListening) { break }
+                Start-Sleep -Milliseconds 100
+            }
         }
-
-        $statusCode   = 200
-        $responseText = '{"ok":true}'
-
-        if ($method -eq 'OPTIONS') {
-            # CORS preflight — headers already set, just respond 200
-        } elseif ($path -eq '/api/scan') {
-            Write-Host "[HTTP] /api/scan received" -ForegroundColor Cyan
-            $script:bgCache['forceJunk'] = $true
-            $script:lastJunkCheck = [DateTime]::MinValue
-        } elseif ($path -eq '/api/cleanup') {
-            Write-Host "[HTTP] /api/cleanup received" -ForegroundColor Yellow
-            Invoke-CleanupFromPayload -Payload $body
-        } else {
-            $statusCode   = 404
-            $responseText = '{"ok":false,"error":"not found"}'
-        }
-
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($responseText)
-        $res.StatusCode      = $statusCode
-        $res.ContentType     = 'application/json'
-        $res.ContentLength64 = $bytes.Length
-        $res.OutputStream.Write($bytes, 0, $bytes.Length)
-    } catch { }
-    try { $res.OutputStream.Close() } catch { }
-}
-
-# Non-blocking poll — call each watcher tick. Uses BeginGetContext/IsCompleted pattern.
-function Test-HttpApiRequests {
-    $l = $script:httpListener
-    if (-not $l -or -not $l.IsListening) { return }
-
-    # If no pending async receive, start one
-    if (-not $script:httpAsyncResult) {
-        try { $script:httpAsyncResult = $l.BeginGetContext($null, $null) } catch { return }
     }
 
-    # Process all completed requests without blocking
-    while ($script:httpAsyncResult -and $script:httpAsyncResult.IsCompleted) {
-        $ar = $script:httpAsyncResult
-        $script:httpAsyncResult = $null
-        try {
-            $ctx = $l.EndGetContext($ar)
-            _Http-HandleContext -ctx $ctx
-        } catch { }
-        # Queue next receive
-        try { $script:httpAsyncResult = $l.BeginGetContext($null, $null) } catch { return }
-    }
+    $ps.AddScript($httpScript) | Out-Null
+    $ps.BeginInvoke() | Out-Null
+
+    $script:httpRunspace   = $rs
+    $script:httpPowerShell = $ps
+    Write-Host "[HTTP] Dedicated server started on :$Port (blocking runspace)" -ForegroundColor Cyan
 }
 
 # Shared cleanup launcher — used by file-signal fallback.
@@ -1699,12 +1720,38 @@ function Test-CleanupSignal {
     return $false
 }
 
+# ----------------------------------------------------------------------------
+# Кэш медленных функций: Get-CachedOrFetch 'key' <ttl_sec> { ... }
+# ----------------------------------------------------------------------------
+function Get-CachedOrFetch {
+    param([string]$Key, [int]$TtlSeconds, [scriptblock]$Fetch)
+    $now = [DateTime]::Now
+    $entry = $script:slowCache[$Key]
+    if ($entry -and $entry.expiresAt -gt $now) { return $entry.data }
+    $data = & $Fetch
+    $script:slowCache[$Key] = @{ data = $data; expiresAt = $now.AddSeconds($TtlSeconds) }
+    return $data
+}
+
 function Write-Snapshot {
     param($Snapshot, [string]$Path)
 
-    $json = $Snapshot | ConvertTo-Json -Depth 10 -Compress:$false
-    $js = "// Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') by Get-SystemInfo.ps1`r`nwindow.SYSTEM_DATA = $json;"
-    Set-Content -Path $Path -Value $js -Encoding UTF8
+    # -Compress убирает пробелы: JSON меньше на 40-60%, быстрее сериализация и передача
+    $json = $Snapshot | ConvertTo-Json -Depth 10 -Compress
+    # Держим актуальный JSON в памяти; HTTP runspace читает его через httpShared
+    $script:currentSnapshotJson = $json
+    $script:httpShared['json']  = $json
+
+    # Файл пишем только при первом запуске и раз в 60 секунд.
+    # Это нужно для initial load браузера; основным транспортом служит HTTP.
+    $now = [DateTime]::Now
+    if ($script:lastFileWrite -eq [DateTime]::MinValue -or ($now - $script:lastFileWrite).TotalSeconds -ge 60) {
+        try {
+            $js = "// Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') by Get-SystemInfo.ps1`r`nwindow.SYSTEM_DATA = $json;"
+            Set-Content -Path $Path -Value $js -Encoding UTF8
+            $script:lastFileWrite = $now
+        } catch { }
+    }
 }
 
 # =============================================================================
@@ -1990,34 +2037,38 @@ function Start-BackgroundWorker {
         $errCheckedAt  = [DateTime]::MinValue
 
         while ($true) {
-            $now = [DateTime]::Now
+            $loopStart = [DateTime]::Now
+            $now       = $loopStart
 
-            # Системные ошибки (быстро, ~1s, каждые 5 мин)
+            # Системные ошибки (быстро ~1s, каждые 5 мин)
             if (($now - $errCheckedAt).TotalSeconds -ge 300) {
                 try { $bgCache['sysErrors'] = Collect-ErrorsData } catch { }
                 $errCheckedAt = [DateTime]::Now
             }
 
-            # GitHub releases (параллельные HTTP, ~7-8s, каждые 30 мин)
+            # GitHub releases (~7-8s параллельно, каждые 30 мин)
             if (($now - $relCheckedAt).TotalSeconds -ge 1800) {
                 try { $bgCache['releases'] = Collect-ReleasesData -Token $bgCache['githubToken'] } catch { }
                 $relCheckedAt = [DateTime]::Now
             }
 
-            # Junk scan (~20-30s, каждые 2 мин или по запросу)
+            # Junk scan (~20-30s, каждые 2 мин или по требованию)
             if ($bgCache['forceJunk'] -or ($now - $junkCheckedAt).TotalSeconds -ge 120) {
                 $bgCache['forceJunk'] = $false
                 try { $bgCache['junk'] = Collect-JunkData -RootDir $bgCache['rootDir'] } catch { }
                 $junkCheckedAt = [DateTime]::Now
             }
 
-            # Windows Updates (COM, ~5-10s, каждые 30 мин — запускаем последним)
+            # Windows Updates (COM ~5-10s, каждые 30 мин)
             if (($now - $updCheckedAt).TotalSeconds -ge 1800) {
                 try { $bgCache['updates'] = Collect-UpdatesData } catch { }
                 $updCheckedAt = [DateTime]::Now
             }
 
-            Start-Sleep -Seconds 5
+            # Спим ровно столько, чтобы цикл занимал ~10 сек независимо от длительности операций
+            $elapsed = ([DateTime]::Now - $loopStart).TotalSeconds
+            $sleep   = [math]::Max(1, [math]::Min(10, 10 - [int]$elapsed))
+            Start-Sleep -Seconds $sleep
         }
     }
 
@@ -2044,16 +2095,26 @@ Write-Host ""
 if ($Watch) {
     Write-Host "Режим: WATCH (интервал $Interval сек). Ctrl+C — остановка." -ForegroundColor Yellow
     Write-Host ""
-    Start-HttpApi
-    # Запускаем фоновый Runspace — тяжёлые операции больше не блокируют основной цикл
+    # HTTP server runs in its own blocking runspace — responds instantly at any time
+    Start-HttpServer
+    # Background runspace handles heavy ops (junk scan, GitHub, WU, errors)
     Start-BackgroundWorker -Cfg $cfg
     while ($true) {
-        Test-HttpApiRequests | Out-Null
-        Test-ScanSignal      | Out-Null
-        Test-CleanupSignal   | Out-Null
+        # Cleanup requested by HTTP runspace
+        if ($script:httpShared['cleanupPending']) {
+            $payload = $script:httpShared['cleanupPayload']
+            $script:httpShared['cleanupPending'] = $false
+            $script:httpShared['cleanupPayload'] = $null
+            Write-Host "[HTTP] /api/cleanup received" -ForegroundColor Yellow
+            Invoke-CleanupFromPayload -Payload $payload
+        }
+
+        Test-ScanSignal    | Out-Null
+        Test-CleanupSignal | Out-Null
 
         $snap = Build-DataSnapshot -Cfg $cfg
         Write-Snapshot -Snapshot $snap -Path $OutputPath
+        $script:firstSnapshot = $false   # со следующего цикла роутер/синолоджи загружаются
         Write-Host "[OK] $(Get-Date -Format 'HH:mm:ss') -> $OutputPath" -ForegroundColor Green
         Start-Sleep -Seconds $Interval
     }
